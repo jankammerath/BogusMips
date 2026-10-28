@@ -1,8 +1,56 @@
-use eframe::egui::{self, Color32};
+use std::sync::Arc;
+
+use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId};
 
 /// Pitch black window and panel background.
 pub const BACKGROUND: Color32 = Color32::BLACK;
 pub const TEXT: Color32 = Color32::from_rgb(0xd4, 0xd4, 0xd4);
+
+const HACK_REGULAR: &[u8] = include_bytes!("../../media/fonts/Hack-Regular.ttf");
+const HACK_BOLD: &[u8] = include_bytes!("../../media/fonts/Hack-Bold.ttf");
+const BOLD_FAMILY: &str = "Hack Bold";
+
+/// Installs the bundled Hack font for all text. egui's default fonts stay
+/// as fallbacks for glyphs Hack lacks (e.g. the emoji used as tree icons).
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "Hack".to_owned(),
+        Arc::new(FontData::from_static(HACK_REGULAR)),
+    );
+    fonts.font_data.insert(
+        "Hack-Bold".to_owned(),
+        Arc::new(FontData::from_static(HACK_BOLD)),
+    );
+
+    let fallbacks = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, "Hack".to_owned());
+    }
+    let mut bold = vec!["Hack-Bold".to_owned()];
+    bold.extend(fallbacks);
+    fonts
+        .families
+        .insert(FontFamily::Name(BOLD_FAMILY.into()), bold);
+    ctx.set_fonts(fonts);
+}
+
+/// The bundled bold face, for headings.
+pub fn bold_family() -> FontFamily {
+    FontFamily::Name(BOLD_FAMILY.into())
+}
+
+pub fn bold(size: f32) -> FontId {
+    FontId::new(size, bold_family())
+}
 
 pub fn apply_dark(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
@@ -75,4 +123,33 @@ pub fn apply_black_window_frame(frame: &eframe::Frame) {
 /// macOS and DWM immersive dark mode on Windows 10 1809+ / Windows 11.
 pub fn apply_dark_window_frame(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hack_is_used_for_all_text() {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        let _ = ctx.run(Default::default(), |_| {});
+        ctx.fonts(|f| {
+            // Hack is monospaced; egui's default proportional font is not.
+            for font in [
+                FontId::proportional(14.0),
+                FontId::monospace(14.0),
+                bold(14.0),
+            ] {
+                assert_eq!(
+                    f.glyph_width(&font, 'i'),
+                    f.glyph_width(&font, 'W'),
+                    "{font:?}"
+                );
+            }
+            // Emoji fallbacks for the tree icons are still available.
+            assert!(f.has_glyph(&FontId::proportional(14.0), '📦'));
+            assert!(f.has_glyph(&bold(14.0), '📦'));
+        });
+    }
 }

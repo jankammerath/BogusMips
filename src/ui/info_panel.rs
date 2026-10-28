@@ -17,28 +17,30 @@ pub fn show(ui: &mut egui::Ui, inspection: Option<&Inspection>) {
                 return;
             };
             for (i, section) in inspection.sections.iter().enumerate() {
-                egui::CollapsingHeader::new(RichText::new(&section.title).strong())
-                    .id_salt(("info_section", i, &section.title))
-                    .default_open(true)
-                    .show(ui, |ui| {
-                        for (key, value) in &section.rows {
-                            if !key.is_empty() {
-                                ui.label(
-                                    RichText::new(key)
-                                        .small()
-                                        .color(ui.visuals().weak_text_color()),
-                                );
-                            }
-                            let monospace = key.contains("SHA") || key == "Signature";
-                            let text = if monospace {
-                                RichText::new(value).monospace()
-                            } else {
-                                RichText::new(value)
-                            };
-                            ui.add(egui::Label::new(text).wrap());
-                            ui.add_space(4.0);
+                egui::CollapsingHeader::new(
+                    RichText::new(&section.title).family(super::theme::bold_family()),
+                )
+                .id_salt(("info_section", i, &section.title))
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (key, value) in &section.rows {
+                        if !key.is_empty() {
+                            ui.label(
+                                RichText::new(key)
+                                    .small()
+                                    .color(ui.visuals().weak_text_color()),
+                            );
                         }
-                    });
+                        let monospace = key.contains("SHA") || key == "Signature";
+                        let text = if monospace {
+                            RichText::new(value).monospace()
+                        } else {
+                            RichText::new(value)
+                        };
+                        ui.add(egui::Label::new(text).wrap());
+                        ui.add_space(4.0);
+                    }
+                });
                 ui.add_space(4.0);
             }
         });

@@ -19,6 +19,8 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
 
 All parsers (ZIP, DEX, smali disassembler, binary XML) are implemented in this repository. They follow Android's behaviour rather than the specs, so tricks that break other tools still open. Examples: malformed extra fields, fake encryption flags, CRC mismatches, and bogus compression methods. Such tricks are reported as warnings.
 
+The UI uses the [Hack](https://github.com/source-foundry/Hack) font, which is embedded in the binary (`media/fonts`, see its [license](media/fonts/LICENSE.md)).
+
 ## Building & running
 
 Requires Rust 1.85 or newer.

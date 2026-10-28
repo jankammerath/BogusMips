@@ -64,43 +64,73 @@ pub fn show(ui: &mut egui::Ui, inspection: &Inspection, mode: &mut ViewMode) {
     }
 }
 
+/// Shows `count` virtualized monospace rows. Each row has a gutter (line
+/// number / offset) that sticks to the left edge while the content scrolls
+/// horizontally underneath it.
 fn monospace_rows(
     ui: &mut egui::Ui,
     id: egui::Id,
     count: usize,
-    mut row: impl FnMut(usize, &egui::FontId) -> LayoutJob,
+    gutter_chars: usize,
+    mut row: impl FnMut(usize, &egui::FontId) -> (String, LayoutJob),
 ) {
     let font = TextStyle::Monospace.resolve(ui.style());
     let row_height = ui.fonts(|f| f.row_height(&font));
+    let char_width = ui.fonts(|f| f.glyph_width(&font, '0'));
+    let gutter_width = gutter_chars as f32 * char_width + 2.0 * GUTTER_PADDING;
     ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
         ScrollArea::both().id_salt(id).auto_shrink(false).show_rows(
             ui,
             row_height,
             count,
             |ui, range| {
+                let viewport_left = ui.clip_rect().left();
+                let background = ui.visuals().panel_fill;
                 for i in range {
-                    ui.add(egui::Label::new(row(i, &font)).extend());
+                    let (gutter, job) = row(i, &font);
+                    let line = ui
+                        .horizontal(|ui| {
+                            ui.add_space(gutter_width);
+                            ui.add(egui::Label::new(job).extend());
+                        })
+                        .response
+                        .rect;
+                    // Painted after the text, so scrolled text slides under it.
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(viewport_left, line.top()),
+                        egui::vec2(gutter_width, line.height().max(row_height)),
+                    );
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, 0.0, background);
+                    painter.text(
+                        egui::pos2(rect.right() - GUTTER_PADDING, rect.top()),
+                        egui::Align2::RIGHT_TOP,
+                        gutter,
+                        font.clone(),
+                        GUTTER,
+                    );
                 }
             },
         );
     });
 }
 
+const GUTTER_PADDING: f32 = 8.0;
+
 fn text_view(ui: &mut egui::Ui, id: egui::Id, lines: &[String], syntax: Syntax) {
     let digits = lines.len().max(1).to_string().len();
-    monospace_rows(ui, id, lines.len(), |i, font| {
+    monospace_rows(ui, id, lines.len(), digits, |i, font| {
         let mut job = LayoutJob::default();
-        append(&mut job, &format!("{:>digits$}  ", i + 1), GUTTER, font);
         highlight_into(&mut job, &lines[i], syntax, font);
-        job
+        ((i + 1).to_string(), job)
     });
 }
 
 fn hex_view(ui: &mut egui::Ui, id: egui::Id, data: &[u8]) {
     const ASCII: egui::Color32 = egui::Color32::from_rgb(0xce, 0x91, 0x78);
     let rows = data.len().div_ceil(16);
-    monospace_rows(ui, id.with("hex"), rows, |row, font| {
+    monospace_rows(ui, id.with("hex"), rows, 8, |row, font| {
         let start = row * 16;
         let chunk = &data[start..(start + 16).min(data.len())];
         let mut hex = String::with_capacity(16 * 3 + 1);
@@ -121,9 +151,83 @@ fn hex_view(ui: &mut egui::Ui, id: egui::Id, data: &[u8]) {
             })
             .collect();
         let mut job = LayoutJob::default();
-        append(&mut job, &format!("{start:08x}  "), GUTTER, font);
         append(&mut job, &format!("{hex:<50}"), TEXT, font);
         append(&mut job, &ascii, ASCII, font);
-        job
+        (format!("{start:08x}"), job)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inspect::{Content, Inspection};
+
+    fn texts(output: &egui::FullOutput) -> Vec<(egui::Pos2, String)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some((t.pos, t.galley.text().to_owned())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn line_numbers_stick_while_scrolling_horizontally() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        let inspection = Inspection {
+            node: 0,
+            title: "x".into(),
+            content: Content::Text {
+                lines: vec![format!("first {}", "x".repeat(2000)), "second".into()],
+                syntax: Syntax::Plain,
+            },
+            raw: None,
+            sections: Vec::new(),
+        };
+        let mut mode = ViewMode::Preview;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| show(ui, &inspection, &mut mode));
+            });
+            texts(&output)
+        };
+        let find = |texts: &[(egui::Pos2, String)], pred: &dyn Fn(&str) -> bool| {
+            texts
+                .iter()
+                .find(|(_, t)| pred(t))
+                .map(|(p, _)| *p)
+                .unwrap()
+        };
+
+        let before = frame(vec![]);
+        let number = find(&before, &|t| t == "1");
+        let code = find(&before, &|t| t.starts_with("first"));
+        let pointer = egui::pos2(400.0, 300.0);
+        frame(vec![egui::Event::PointerMoved(pointer)]);
+        for _ in 0..5 {
+            frame(vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-200.0, 0.0),
+                modifiers: Default::default(),
+            }]);
+        }
+        let after = frame(vec![]);
+        let number_after = find(&after, &|t| t == "1");
+        let code_after = find(&after, &|t| t.starts_with("first"));
+        assert!(
+            code_after.x < code.x - 100.0,
+            "content did not scroll: {code:?} -> {code_after:?}"
+        );
+        assert_eq!(number, number_after, "line number moved");
+        assert!(number.x < code.x);
+    }
 }

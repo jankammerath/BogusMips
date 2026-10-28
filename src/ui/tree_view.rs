@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use eframe::egui::{self, Color32, FontId, Key, ScrollArea, Sense, Shape, Stroke, pos2, vec2};
+use eframe::egui::{self, Color32, Key, ScrollArea, Sense, Shape, Stroke, pos2, vec2};
 
 use crate::package::{NodeId, NodeKind, Package};
 
@@ -173,7 +173,7 @@ fn paint_row(
     let (label, label_font) = if is_root {
         (
             node.label.to_uppercase(),
-            FontId::proportional(body.size - 1.0),
+            super::theme::bold(body.size - 1.0),
         )
     } else {
         (node.label.clone(), body.clone())
@@ -220,10 +220,6 @@ fn paint_row(
         painter.galley(pos, g, text_color);
     }
     let pos = pos2(text_x, center_y - label_galley.size().y / 2.0);
-    if is_root {
-        // Faux bold: egui's default font has no bold face.
-        painter.galley(pos + vec2(0.5, 0.0), label_galley.clone(), text_color);
-    }
     painter.galley(pos, label_galley, text_color);
     response
 }
@@ -240,7 +236,7 @@ pub fn show(
     ui.label(
         egui::RichText::new("PACKAGE")
             .small()
-            .strong()
+            .family(super::theme::bold_family())
             .color(ui.visuals().weak_text_color()),
     );
     ui.add_space(2.0);

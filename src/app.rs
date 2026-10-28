@@ -43,6 +43,7 @@ impl BogusMipsApp {
     }
 
     pub fn with_context(ctx: &egui::Context, initial_file: Option<PathBuf>) -> Self {
+        theme::install_fonts(ctx);
         theme::apply_dark(ctx);
         egui_extras::install_image_loaders(ctx);
         Self {
@@ -296,7 +297,12 @@ impl BogusMipsApp {
                     return;
                 }
                 ui.horizontal(|ui| {
-                    ui.strong("File information");
+                    ui.label(
+                        RichText::new("FILE INFORMATION")
+                            .small()
+                            .family(theme::bold_family())
+                            .color(ui.visuals().weak_text_color()),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
                             .add(egui::Button::new("»").frame(false))
