@@ -11,9 +11,13 @@ eframe = "0.32.3"
 egui_extras = { version = "0.32", features = ["image"] }
 flate2 = "1.1.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+raw-window-handle = "0.6"
 rfd = "0.17.2"
 sha2 = "0.11.0"
 
 [profile.release]
 lto = true
 codegen-units = 1
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }

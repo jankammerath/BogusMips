@@ -34,6 +34,7 @@ pub struct BogusMipsApp {
     error: Option<String>,
     show_info: bool,
     native_theme_applied: bool,
+    window_title: String,
 }
 
 impl BogusMipsApp {
@@ -51,6 +52,7 @@ impl BogusMipsApp {
             error: None,
             show_info: true,
             native_theme_applied: false,
+            window_title: "BogusMips".to_owned(),
         }
     }
 
@@ -83,7 +85,7 @@ impl BogusMipsApp {
                 let tree = TreeState::new(&package);
                 let root = package.root();
                 let title = format!("{} — BogusMips", package.archives[0].name);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+                self.set_title(ctx, title);
                 let mut doc = Document {
                     package,
                     tree,
@@ -113,8 +115,45 @@ impl BogusMipsApp {
     fn close(&mut self, ctx: &egui::Context) {
         if self.document.take().is_some() {
             ctx.forget_all_images();
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title("BogusMips".to_owned()));
+            self.set_title(ctx, "BogusMips".to_owned());
         }
+    }
+
+    fn set_title(&mut self, ctx: &egui::Context, title: String) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+        self.window_title = title;
+    }
+
+    /// macOS: the black strip behind the traffic lights, showing the window
+    /// title and acting as the drag handle (the native title bar is hidden).
+    fn title_bar(&self, ctx: &egui::Context) {
+        let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+        if !cfg!(target_os = "macos") || fullscreen {
+            return;
+        }
+        egui::TopBottomPanel::top("title_bar")
+            .exact_height(theme::MACOS_TITLE_BAR_HEIGHT)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(theme::BACKGROUND))
+            .show(ctx, |ui| {
+                let rect = ui.max_rect();
+                let response =
+                    ui.interact(rect, ui.id().with("drag"), egui::Sense::click_and_drag());
+                if response.drag_started() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                if response.double_clicked() {
+                    let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                }
+                ui.painter().text(
+                    rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &self.window_title,
+                    egui::FontId::proportional(13.0),
+                    egui::Color32::from_rgb(0xcc, 0xcc, 0xcc),
+                );
+            });
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
@@ -344,6 +383,10 @@ fn select(ctx: &egui::Context, doc: &mut Document, node: NodeId) {
 
 impl eframe::App for BogusMipsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(target_os = "windows")]
+        if !self.native_theme_applied {
+            theme::apply_black_window_frame(_frame);
+        }
         self.ui(ctx);
     }
 
@@ -365,6 +408,7 @@ impl BogusMipsApp {
         }
         self.poll_loading(ctx);
 
+        self.title_bar(ctx);
         self.menu_bar(ctx);
         self.status_bar(ctx);
 
@@ -447,6 +491,37 @@ mod tests {
         let expected = egui::Color32::BLACK;
         assert_eq!(visuals.panel_fill, expected);
         assert_eq!(visuals.window_fill, expected);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn draws_title_in_black_macos_title_bar() {
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| app.ui(ctx));
+        let texts: Vec<(egui::Pos2, String)> = output
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Text(t) => Some((t.pos, t.galley.text().to_owned())),
+                _ => None,
+            })
+            .collect();
+        let bar = theme::MACOS_TITLE_BAR_HEIGHT;
+        let (title_pos, _) = texts.iter().find(|(_, t)| t == "BogusMips").expect("title");
+        assert!(title_pos.y < bar && title_pos.x > 500.0, "{title_pos:?}");
+        let (file_pos, _) = texts.iter().find(|(_, t)| t == "File").expect("menu");
+        assert!(
+            file_pos.y >= bar,
+            "menu bar overlaps the title bar: {file_pos:?}"
+        );
     }
 
     #[test]

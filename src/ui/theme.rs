@@ -19,6 +19,57 @@ pub fn apply_dark(ctx: &egui::Context) {
     });
 }
 
+/// Height of the area behind the macOS traffic lights, which the app paints
+/// itself (see [`window_options`]).
+pub const MACOS_TITLE_BAR_HEIGHT: f32 = 28.0;
+
+/// Native window options for a pitch black frame. On macOS the title bar is
+/// made transparent and the content extends behind it, because the system
+/// dark title bar is grey; the app then draws the title itself.
+pub fn window_options(builder: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    if cfg!(target_os = "macos") {
+        builder
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false)
+    } else {
+        builder
+    }
+}
+
+/// Windows 11: paints the caption (title bar) and border black. Earlier
+/// Windows versions do not support these attributes and keep the dark frame.
+#[cfg(target_os = "windows")]
+pub fn apply_black_window_frame(frame: &eframe::Frame) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DwmSetWindowAttribute,
+    };
+
+    let Ok(handle) = frame.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as HWND;
+    // COLORREF is 0x00BBGGRR.
+    let black: u32 = 0x0000_0000;
+    for attribute in [DWMWA_CAPTION_COLOR, DWMWA_BORDER_COLOR] {
+        // SAFETY: `hwnd` is the live window owned by eframe, and the pointer
+        // refers to a 4-byte COLORREF as the attributes require.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attribute as u32,
+                (&black as *const u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+}
+
 /// Forces the native window decorations (title bar / frame) into dark mode,
 /// independent of the OS appearance setting. Uses `NSAppearance` (darkAqua) on
 /// macOS and DWM immersive dark mode on Windows 10 1809+ / Windows 11.
