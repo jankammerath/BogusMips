@@ -4,7 +4,8 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
 
 ## Features
 
-- Open an `*.apk` or `*.xapk` with **File → Open…** (⌘O / Ctrl+O), by dropping it onto the window, or as a command-line argument.
+- VS Code style interface (Dark+ colors): activity bar with the application menu (☰), **Explorer** and **Search** views, an editor with tab and breadcrumbs, a file information panel and a status bar.
+- Open an `*.apk` or `*.xapk` with **☰ → File → Open…** (⌘O / Ctrl+O), by dropping it onto the window, or as a command-line argument.
 - **Left: package tree**
   - **Source code**: every class from all `classes*.dex` files, grouped by Java package and disassembled to smali.
   - **Resources**: `resources.arsc` decoded into the `res/values*/*.xml` files it was compiled from (strings, colors, dimens, styles, attrs, arrays, plurals, …) plus `public.xml` with every resource ID.
@@ -12,6 +13,7 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
   - XAPK bundles show each contained APK (base and split APKs) separately.
   - Filter box (⌘F) and keyboard navigation with the arrow keys.
   - Right-click an item (or **File → Export…**, ⌘E) to export it: files as stored in the package, or **as shown** (decoded binary XML, beautified text); classes as `.smali`; generated resource files as XML; APKs contained in an XAPK as `.apk`.
+- **Search** (⇧⌘F): searches the contents of all classes (smali), text files, decoded XML and generated resource files, with match case / whole word / regular expression options. Clicking a result opens it in the editor at the highlighted match. The search index is built in the background on the first search.
 - **Center: content of the selected item**
   - Classes are shown as smali (baksmali-compatible output).
   - Binary XML (`AndroidManifest.xml`, `res/**/*.xml`) is decoded. Resource references are resolved to names (`@string/app_name`, `@android:style/Theme`), and attribute values to their symbolic names (`protectionLevel="signature"`).
@@ -51,6 +53,8 @@ cargo run --release --example dump_smali -- app.apk out-dir
 cargo run --release --example dump_resources -- app.apk out-dir
 # Beautify a file as the content view does (format detected from the name, or given)
 cargo run --release --example beautify_file -- in.min.js out.js [json|xml|html|css|js]
+# Search a package's contents like the Search view, with timings
+cargo run --release --example search_package -- app.apk "getString" [--regex] [--case] [--word]
 # Open packages and inspect every node, reporting timings and decode errors
 cargo run --release --example inspect_all -- app.apk other.xapk
 ```
@@ -63,6 +67,7 @@ src/
 ├── lib.rs
 ├── app.rs               # application state, menus, panels, background loading
 ├── inspect.rs           # turns a tree node into content + file information
+├── search.rs            # content search: background index, regex search
 ├── beautify/            # whitespace-only pretty-printers: JSON, XML/HTML, CSS, JavaScript
 ├── package/
 │   ├── mod.rs           # APK/XAPK loading, entry extraction, manifest summary
@@ -87,5 +92,7 @@ src/
     ├── tree_view.rs     # left panel
     ├── content_view.rs  # center panel (text, hex, image)
     ├── info_panel.rs    # right panel
+    ├── search_view.rs   # sidebar search view
+    ├── icons.rs         # vector icons (codicon style)
     └── highlight.rs     # smali / XML syntax highlighting
 ```

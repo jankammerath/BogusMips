@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
@@ -6,7 +7,10 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 use crate::export::{self, ExportKind};
 use crate::inspect::{Content, Inspection, format_size, group_digits, inspect};
 use crate::package::{NodeId, Package, PackageKind};
-use crate::ui::content_view::{self, ViewMode};
+use crate::search::SearchController;
+use crate::ui::content_view::{self, Goto, ViewMode};
+use crate::ui::icons::{self, Icon};
+use crate::ui::search_view::{self, SearchAction, SearchViewState};
 use crate::ui::tree_view::{self, TreeState};
 use crate::ui::{info_panel, theme};
 
@@ -15,6 +19,18 @@ const CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W
 const TOGGLE_INFO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::I);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
 const EXPORT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
+const SHOW_EXPLORER: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
+const SHOW_SEARCH: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
+const ACTIVITY_BAR_WIDTH: f32 = 48.0;
+
+/// The views of the left sidebar, selected in the activity bar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SideView {
+    Explorer,
+    Search,
+}
 
 /// Asks where to save an export, given the suggested file name.
 type SaveDialog = Box<dyn Fn(&str) -> Option<PathBuf>>;
@@ -32,11 +48,30 @@ struct Loading {
 }
 
 struct Document {
-    package: Package,
+    package: Arc<Package>,
     tree: TreeState,
     selected: Option<NodeId>,
     inspection: Option<Inspection>,
     view_mode: ViewMode,
+    /// Location to highlight in the editor (e.g. a search match).
+    goto: Option<Goto>,
+    search: SearchController,
+    search_view: SearchViewState,
+}
+
+impl Document {
+    fn new(package: Package) -> Self {
+        Self {
+            tree: TreeState::new(&package),
+            package: Arc::new(package),
+            selected: None,
+            inspection: None,
+            view_mode: ViewMode::default(),
+            goto: None,
+            search: SearchController::new(),
+            search_view: SearchViewState::default(),
+        }
+    }
 }
 
 pub struct BogusMipsApp {
@@ -50,6 +85,8 @@ pub struct BogusMipsApp {
     notice: Option<String>,
     save_dialog: SaveDialog,
     show_info: bool,
+    show_sidebar: bool,
+    sidebar_view: SideView,
     native_theme_applied: bool,
     window_title: String,
 }
@@ -72,6 +109,8 @@ impl BogusMipsApp {
             notice: None,
             save_dialog: Box::new(native_save_dialog),
             show_info: true,
+            show_sidebar: true,
+            sidebar_view: SideView::Explorer,
             native_theme_applied: false,
             window_title: "BogusMips".to_owned(),
         }
@@ -103,17 +142,10 @@ impl BogusMipsApp {
         let Some(loading) = &self.loading else { return };
         match loading.rx.try_recv() {
             Ok(Ok(package)) => {
-                let tree = TreeState::new(&package);
                 let root = package.root();
                 let title = format!("{} — BogusMips", package.archives[0].name);
                 self.set_title(ctx, title);
-                let mut doc = Document {
-                    package,
-                    tree,
-                    selected: None,
-                    inspection: None,
-                    view_mode: ViewMode::default(),
-                };
+                let mut doc = Document::new(package);
                 select(ctx, &mut doc, root);
                 self.document = Some(doc);
                 self.loading = None;
@@ -188,17 +220,47 @@ impl BogusMipsApp {
         self.window_title = title;
     }
 
-    /// macOS: the black strip behind the traffic lights, showing the window
-    /// title and acting as the drag handle (the native title bar is hidden).
-    fn title_bar(&self, ctx: &egui::Context) {
+    /// Opens a sidebar view, or hides the sidebar if that view is showing
+    /// (like clicking an activity bar icon in VS Code).
+    fn toggle_view(&mut self, ctx: &egui::Context, view: SideView) {
+        if self.show_sidebar && self.sidebar_view == view {
+            self.show_sidebar = false;
+        } else {
+            self.show_view(ctx, view);
+        }
+    }
+
+    fn show_view(&mut self, ctx: &egui::Context, view: SideView) {
+        self.show_sidebar = true;
+        self.sidebar_view = view;
+        let focus = match view {
+            SideView::Explorer => tree_view::FILTER_ID,
+            SideView::Search => search_view::INPUT_ID,
+        };
+        if view == SideView::Search {
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new(focus)));
+        }
+    }
+
+    /// macOS: the title bar area behind the traffic lights (the native title
+    /// bar is hidden). Shows the title in VS Code's command center box,
+    /// which opens the search view, and acts as the window's drag handle.
+    fn title_bar(&mut self, ctx: &egui::Context) {
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if !cfg!(target_os = "macos") || fullscreen {
+            // Small gap above the cards under the native title bar.
+            egui::TopBottomPanel::top("top_gap")
+                .exact_height(4.0)
+                .show_separator_line(false)
+                .frame(egui::Frame::NONE.fill(theme::WINDOW))
+                .show(ctx, |_| {});
             return;
         }
+        let mut open_search = false;
         egui::TopBottomPanel::top("title_bar")
             .exact_height(theme::MACOS_TITLE_BAR_HEIGHT)
             .show_separator_line(false)
-            .frame(egui::Frame::NONE.fill(theme::BACKGROUND))
+            .frame(egui::Frame::NONE.fill(theme::WINDOW))
             .show(ctx, |ui| {
                 let rect = ui.max_rect();
                 let response =
@@ -210,17 +272,60 @@ impl BogusMipsApp {
                     let maximized = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                 }
-                ui.painter().text(
-                    rect.center(),
+                let width = (rect.width() * 0.4).clamp(200.0, 500.0);
+                let center = egui::Rect::from_center_size(rect.center(), egui::vec2(width, 24.0));
+                let center_response = ui
+                    .interact(center, ui.id().with("command_center"), egui::Sense::click())
+                    .on_hover_text("Search file contents (⇧⌘F)");
+                let fill = if center_response.hovered() {
+                    egui::Color32::from_rgb(0x50, 0x50, 0x50)
+                } else {
+                    theme::COMMAND_CENTER
+                };
+                ui.painter().rect(
+                    center,
+                    6.0,
+                    fill,
+                    egui::Stroke::new(1.0, theme::COMMAND_CENTER_BORDER),
+                    egui::StrokeKind::Inside,
+                );
+                icons::paint(
+                    ui.painter(),
+                    egui::Rect::from_center_size(
+                        egui::pos2(center.left() + 16.0, center.center().y),
+                        egui::vec2(14.0, 14.0),
+                    ),
+                    Icon::Search,
+                    theme::TEXT_DIM,
+                );
+                ui.painter_at(center.shrink2(egui::vec2(28.0, 0.0))).text(
+                    center.center(),
                     egui::Align2::CENTER_CENTER,
                     &self.window_title,
-                    egui::FontId::proportional(13.0),
-                    egui::Color32::from_rgb(0xcc, 0xcc, 0xcc),
+                    egui::FontId::proportional(12.0),
+                    theme::TEXT,
                 );
+                open_search = center_response.clicked();
             });
+        if open_search {
+            self.show_view(ctx, SideView::Search);
+        }
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
+        // Shift variants first: shortcuts without Shift also match with it.
+        let (show_explorer, show_search) = ctx.input_mut(|i| {
+            (
+                i.consume_shortcut(&SHOW_EXPLORER),
+                i.consume_shortcut(&SHOW_SEARCH),
+            )
+        });
+        if show_explorer {
+            self.show_view(ctx, SideView::Explorer);
+        }
+        if show_search {
+            self.show_view(ctx, SideView::Search);
+        }
         let (open, close, toggle_info, find, export, dropped) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&OPEN),
@@ -241,6 +346,7 @@ impl BogusMipsApp {
             self.show_info = !self.show_info;
         }
         if find {
+            self.show_view(ctx, SideView::Explorer);
             ctx.memory_mut(|m| m.request_focus(egui::Id::new(tree_view::FILTER_ID)));
         }
         if export {
@@ -251,195 +357,326 @@ impl BogusMipsApp {
         }
     }
 
-    fn menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui
-                        .add(egui::Button::new("Open…").shortcut_text(ctx.format_shortcut(&OPEN)))
-                        .clicked()
-                    {
-                        self.pick_file();
-                    }
-                    let can_export = self.primary_export().is_some();
-                    if ui
-                        .add_enabled(
-                            can_export,
-                            egui::Button::new("Export…").shortcut_text(ctx.format_shortcut(&EXPORT)),
-                        )
-                        .on_hover_text("Export the selected item (also available by right-clicking it in the tree)")
-                        .clicked()
-                    {
-                        self.request_primary_export();
-                    }
-                    if ui
-                        .add_enabled(
-                            self.document.is_some(),
-                            egui::Button::new("Close").shortcut_text(ctx.format_shortcut(&CLOSE)),
-                        )
-                        .clicked()
-                    {
-                        self.close(ctx);
-                    }
-                    ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-                ui.menu_button("View", |ui| {
-                    let label = if self.show_info {
-                        "Hide file information"
-                    } else {
-                        "Show file information"
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(label)
-                                .shortcut_text(ctx.format_shortcut(&TOGGLE_INFO)),
-                        )
-                        .clicked()
-                    {
-                        self.show_info = !self.show_info;
-                    }
-                });
-            });
-        });
-    }
-
-    fn status_bar(&self, ctx: &egui::Context) {
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                if let Some(loading) = &self.loading {
-                    ui.spinner();
-                    ui.label(format!("Opening {}…", loading.path.display()));
-                } else if let Some(doc) = &self.document {
-                    let pkg = &doc.package;
-                    let kind = match pkg.kind {
-                        PackageKind::Apk => "APK",
-                        PackageKind::Xapk => "XAPK",
-                    };
-                    let classes: usize = pkg.dex_files.iter().map(|d| d.dex.class_defs.len()).sum();
-                    let warnings: usize =
-                        pkg.archives.iter().map(|a| a.warnings.len()).sum::<usize>()
-                            + pkg
-                                .dex_files
-                                .iter()
-                                .map(|d| d.dex.warnings.len())
-                                .sum::<usize>();
-                    ui.label(format!(
-                        "{kind} · {} files · {} DEX · {} classes",
-                        group_digits(pkg.files.len()),
-                        pkg.dex_files.len(),
-                        group_digits(classes)
-                    ));
-                    if warnings > 0 {
-                        ui.label(
-                            RichText::new(format!("⚠ {warnings} warnings"))
-                                .color(ui.visuals().warn_fg_color),
-                        )
-                        .on_hover_text("Select the package root to see the warnings");
-                    }
-                } else {
-                    ui.label("No file open");
-                }
-                if let Some(notice) = &self.notice {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new(format!("✔ {notice}"))
-                                    .color(ui.visuals().weak_text_color()),
-                            )
-                            .truncate(),
-                        );
-                    });
-                }
-            });
-        });
-    }
-
-    fn info_panel(&mut self, ctx: &egui::Context) {
-        let inspection = self.document.as_ref().and_then(|d| d.inspection.as_ref());
-        let mut toggle = false;
-        let expanded = egui::SidePanel::right("info_panel")
-            .resizable(true)
-            .default_width(300.0)
-            .min_width(220.0);
-        let collapsed = egui::SidePanel::right("info_panel_collapsed")
-            .resizable(false)
-            .exact_width(28.0);
-        egui::SidePanel::show_animated_between(
-            ctx,
-            self.show_info,
-            collapsed,
-            expanded,
-            |ui, how_expanded| {
-                if how_expanded < 0.5 {
-                    ui.vertical_centered(|ui| {
-                        if ui
-                            .add(egui::Button::new("«").frame(false))
-                            .on_hover_text("Show file information (⌘I)")
-                            .clicked()
-                        {
-                            toggle = true;
-                        }
-                    });
-                    return;
-                }
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("FILE INFORMATION")
-                            .small()
-                            .family(theme::bold_family())
-                            .color(ui.visuals().weak_text_color()),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .add(egui::Button::new("»").frame(false))
-                            .on_hover_text("Hide file information (⌘I)")
-                            .clicked()
-                        {
-                            toggle = true;
-                        }
-                    });
-                });
-                ui.separator();
-                info_panel::show(ui, inspection);
-            },
-        );
-        if toggle {
-            self.show_info = !self.show_info;
-        }
-    }
-
-    fn welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() / 2.0 - 90.0).max(0.0));
-            if let Some(loading) = &self.loading {
-                ui.spinner();
-                ui.label(format!("Opening {}…", file_name(&loading.path)));
-                return;
-            }
-            ui.heading(RichText::new("BogusMips").size(32.0));
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new("See how far your Android app can be disassembled.")
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.add_space(16.0);
+    /// The application menu (☰ in the activity bar).
+    fn app_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.menu_button("File", |ui| {
             if ui
-                .add(egui::Button::new(
-                    RichText::new("Open APK or XAPK…").size(16.0),
-                ))
+                .add(egui::Button::new("Open…").shortcut_text(ctx.format_shortcut(&OPEN)))
                 .clicked()
             {
                 self.pick_file();
             }
-            ui.add_space(8.0);
-            ui.label(
-                RichText::new("or drop a file onto this window")
-                    .small()
-                    .color(ui.visuals().weak_text_color()),
+            let can_export = self.primary_export().is_some();
+            if ui
+                .add_enabled(
+                    can_export,
+                    egui::Button::new("Export…").shortcut_text(ctx.format_shortcut(&EXPORT)),
+                )
+                .on_hover_text(
+                    "Export the selected item (also available by right-clicking it in the tree)",
+                )
+                .clicked()
+            {
+                self.request_primary_export();
+            }
+            if ui
+                .add_enabled(
+                    self.document.is_some(),
+                    egui::Button::new("Close").shortcut_text(ctx.format_shortcut(&CLOSE)),
+                )
+                .clicked()
+            {
+                self.close(ctx);
+            }
+            ui.separator();
+            if ui.button("Quit").clicked() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        });
+        ui.menu_button("View", |ui| {
+            if ui
+                .add(
+                    egui::Button::new("Explorer")
+                        .shortcut_text(ctx.format_shortcut(&SHOW_EXPLORER)),
+                )
+                .clicked()
+            {
+                self.show_view(ctx, SideView::Explorer);
+            }
+            if ui
+                .add(egui::Button::new("Search").shortcut_text(ctx.format_shortcut(&SHOW_SEARCH)))
+                .clicked()
+            {
+                self.show_view(ctx, SideView::Search);
+            }
+            ui.separator();
+            let label = if self.show_info {
+                "Hide File Information"
+            } else {
+                "Show File Information"
+            };
+            if ui
+                .add(egui::Button::new(label).shortcut_text(ctx.format_shortcut(&TOGGLE_INFO)))
+                .clicked()
+            {
+                self.show_info = !self.show_info;
+            }
+        });
+    }
+
+    /// The icon column on the far left.
+    fn activity_bar(&mut self, ctx: &egui::Context) {
+        let item = |ui: &mut egui::Ui, icon: Icon, active: bool, tooltip: &str| {
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(ACTIVITY_BAR_WIDTH, 44.0), egui::Sense::click());
+            if active {
+                ui.painter().rect_filled(
+                    rect.shrink2(egui::vec2(6.0, 3.0)),
+                    6.0,
+                    theme::ACTIVITY_ACTIVE_BG,
+                );
+            }
+            let color = if active || response.hovered() {
+                theme::ICON_ACTIVE
+            } else {
+                theme::ICON_INACTIVE
+            };
+            icons::paint(
+                ui.painter(),
+                egui::Rect::from_center_size(rect.center(), egui::vec2(22.0, 22.0)),
+                icon,
+                color,
             );
+            response.on_hover_text(tooltip)
+        };
+        let mut toggle = None;
+        egui::SidePanel::left("activity_bar")
+            .exact_width(ACTIVITY_BAR_WIDTH)
+            .resizable(false)
+            .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(theme::ACTIVITY_BAR))
+            .show(ctx, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add_space(4.0);
+                let menu = item(ui, Icon::Menu, false, "Application menu");
+                egui::Popup::menu(&menu).show(|ui| {
+                    ui.set_min_width(160.0);
+                    self.app_menu(ui, ctx);
+                });
+                let explorer = self.show_sidebar && self.sidebar_view == SideView::Explorer;
+                if item(ui, Icon::Files, explorer, "Explorer (⇧⌘E)").clicked() {
+                    toggle = Some(SideView::Explorer);
+                }
+                let search = self.show_sidebar && self.sidebar_view == SideView::Search;
+                if item(ui, Icon::Search, search, "Search (⇧⌘F)").clicked() {
+                    toggle = Some(SideView::Search);
+                }
+            });
+        if let Some(view) = toggle {
+            self.toggle_view(ctx, view);
+        }
+    }
+
+    fn status_bar(&self, ctx: &egui::Context) {
+        let text = |s: String| RichText::new(s).color(theme::TEXT_BRIGHT).size(12.0);
+        egui::TopBottomPanel::bottom("status_bar")
+            .exact_height(22.0)
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::STATUS_BAR)
+                    .inner_margin(egui::Margin::symmetric(10, 0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 16.0;
+                    if let Some(loading) = &self.loading {
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::TEXT_BRIGHT));
+                        ui.label(text(format!("Opening {}…", file_name(&loading.path))));
+                    } else if let Some(doc) = &self.document {
+                        let pkg = &doc.package;
+                        let kind = match pkg.kind {
+                            PackageKind::Apk => "APK",
+                            PackageKind::Xapk => "XAPK",
+                        };
+                        let classes: usize =
+                            pkg.dex_files.iter().map(|d| d.dex.class_defs.len()).sum();
+                        let warnings: usize =
+                            pkg.archives.iter().map(|a| a.warnings.len()).sum::<usize>()
+                                + pkg
+                                    .dex_files
+                                    .iter()
+                                    .map(|d| d.dex.warnings.len())
+                                    .sum::<usize>();
+                        ui.label(text(format!(
+                            "{kind}  {} files  {} DEX  {} classes",
+                            group_digits(pkg.files.len()),
+                            pkg.dex_files.len(),
+                            group_digits(classes)
+                        )));
+                        if warnings > 0 {
+                            ui.label(text(format!("⚠ {warnings}")))
+                                .on_hover_text("Warnings: select the package root to see them");
+                        }
+                    } else {
+                        ui.label(text("No package open".to_owned()));
+                    }
+                    if let Some(notice) = &self.notice {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add(egui::Label::new(text(format!("✔ {notice}"))).truncate());
+                        });
+                    }
+                });
+            });
+    }
+
+    fn info_panel(&mut self, ctx: &egui::Context) {
+        let inspection = self.document.as_ref().and_then(|d| d.inspection.as_ref());
+        let mut close = false;
+        egui::SidePanel::right("info_panel")
+            .resizable(true)
+            .default_width(300.0)
+            .min_width(220.0)
+            .show_separator_line(false)
+            .frame(theme::card(theme::SIDEBAR))
+            .show(ctx, |ui| {
+                close = info_panel::show(ui, inspection);
+            });
+        if close {
+            self.show_info = false;
+        }
+    }
+
+    fn sidebar(&mut self, ctx: &egui::Context) {
+        let mut pick = false;
+        let mut search_action = None;
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(300.0)
+            .min_width(200.0)
+            .show_separator_line(false)
+            .frame(theme::card(theme::SIDEBAR))
+            .show(ctx, |ui| match (self.sidebar_view, &mut self.document) {
+                (SideView::Explorer, Some(doc)) => {
+                    let response = tree_view::show(ui, &doc.package, &mut doc.tree, doc.selected);
+                    if let Some(node) = response.selected {
+                        select(ctx, doc, node);
+                    }
+                    if response.export.is_some() {
+                        self.pending_export = response.export;
+                    }
+                }
+                (SideView::Explorer, None) => pick = tree_view::show_empty(ui),
+                (SideView::Search, doc) => {
+                    let doc = doc
+                        .as_mut()
+                        .map(|d| (&*d.package, &mut d.search, &mut d.search_view));
+                    search_action = search_view::show(ui, doc);
+                }
+            });
+        match search_action {
+            Some(SearchAction::Open { node, line, range }) => {
+                if let Some(doc) = &mut self.document {
+                    select(ctx, doc, node);
+                    doc.goto = Some(Goto {
+                        line,
+                        range,
+                        scroll: true,
+                    });
+                }
+            }
+            Some(SearchAction::PickFile) => pick = true,
+            None => {}
+        }
+        if pick {
+            self.pick_file();
+        }
+    }
+
+    fn editor(&mut self, ctx: &egui::Context) {
+        let mut toggle_info = false;
+        egui::CentralPanel::default()
+            .frame(theme::card(theme::EDITOR))
+            .show(ctx, |ui| match &mut self.document {
+                Some(doc) => {
+                    let response = content_view::show(
+                        ui,
+                        doc.inspection.as_ref(),
+                        &mut doc.view_mode,
+                        doc.goto.as_mut(),
+                        self.show_info,
+                    );
+                    if response.close {
+                        deselect(ctx, doc);
+                    }
+                    toggle_info = response.toggle_info;
+                }
+                None => self.welcome(ui),
+            });
+        if toggle_info {
+            self.show_info = !self.show_info;
+        }
+    }
+
+    /// The editor card without a package: VS Code's welcome page.
+    fn welcome(&mut self, ui: &mut egui::Ui) {
+        if let Some(loading) = &self.loading {
+            ui.centered_and_justified(|ui| {
+                ui.horizontal_centered(|ui| {
+                    ui.spinner();
+                    ui.label(format!("Opening {}…", file_name(&loading.path)));
+                });
+            });
+            return;
+        }
+        let link = |ui: &mut egui::Ui, icon: Icon, text: &str| {
+            let response = ui
+                .horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                    icons::paint(ui.painter(), rect, icon, theme::LINK);
+                    ui.add(
+                        egui::Label::new(RichText::new(text).color(theme::LINK))
+                            .sense(egui::Sense::click()),
+                    )
+                })
+                .inner;
+            response.on_hover_cursor(egui::CursorIcon::PointingHand)
+        };
+        let width = ui.available_width().min(560.0);
+        ui.add_space((ui.available_height() * 0.18).max(24.0));
+        ui.horizontal(|ui| {
+            ui.add_space(((ui.available_width() - width) / 2.0).max(24.0));
+            ui.vertical(|ui| {
+                ui.set_max_width(width);
+                ui.label(
+                    RichText::new("BogusMips")
+                        .size(28.0)
+                        .color(theme::TEXT_BRIGHT),
+                );
+                ui.label(
+                    RichText::new("See how far your Android app can be disassembled.")
+                        .color(theme::TEXT_DIM),
+                );
+                ui.add_space(28.0);
+                ui.label(RichText::new("Start").size(17.0).color(theme::TEXT));
+                ui.add_space(8.0);
+                if link(ui, Icon::Files, "Open APK or XAPK…").clicked() {
+                    self.pick_file();
+                }
+                ui.add_space(28.0);
+                ui.label(RichText::new("Tips").size(17.0).color(theme::TEXT));
+                ui.add_space(8.0);
+                for tip in [
+                    "Drop an .apk or .xapk file onto this window to open it.",
+                    "Search the contents of all classes and files with ⇧⌘F.",
+                    "Right-click an item in the Explorer to export it.",
+                    "Toggle the file information panel with ⌘I.",
+                ] {
+                    ui.label(RichText::new(tip).color(theme::TEXT_DIM));
+                    ui.add_space(4.0);
+                }
+            });
         });
     }
 }
@@ -475,6 +712,21 @@ fn select(ctx: &egui::Context, doc: &mut Document, node: NodeId) {
             });
     doc.inspection = Some(inspection);
     doc.view_mode = ViewMode::Preview;
+    doc.goto = None;
+}
+
+/// Closes the editor tab (nothing selected).
+fn deselect(ctx: &egui::Context, doc: &mut Document) {
+    if let Some(Inspection {
+        content: Content::Image { uri, .. },
+        ..
+    }) = &doc.inspection
+    {
+        ctx.forget_image(uri);
+    }
+    doc.selected = None;
+    doc.inspection = None;
+    doc.goto = None;
 }
 
 impl eframe::App for BogusMipsApp {
@@ -503,39 +755,21 @@ impl BogusMipsApp {
             self.start_loading(ctx, path);
         }
         self.poll_loading(ctx);
-
-        self.title_bar(ctx);
-        self.menu_bar(ctx);
-        self.status_bar(ctx);
-
         if let Some(doc) = &mut self.document {
-            egui::SidePanel::left("tree_panel")
-                .resizable(true)
-                .default_width(320.0)
-                .min_width(200.0)
-                .show(ctx, |ui| {
-                    let response = tree_view::show(ui, &doc.package, &mut doc.tree, doc.selected);
-                    if let Some(node) = response.selected {
-                        select(ctx, doc, node);
-                    }
-                    if response.export.is_some() {
-                        self.pending_export = response.export;
-                    }
-                });
+            doc.search.poll(&doc.package, ctx);
         }
-        if self.document.is_some() {
+
+        // Panel order matters: full-width bars first, then the columns.
+        self.title_bar(ctx);
+        self.status_bar(ctx);
+        self.activity_bar(ctx);
+        if self.show_sidebar {
+            self.sidebar(ctx);
+        }
+        if self.document.is_some() && self.show_info {
             self.info_panel(ctx);
         }
-
-        egui::CentralPanel::default().show(ctx, |ui| match &mut self.document {
-            Some(Document {
-                inspection: Some(inspection),
-                view_mode,
-                ..
-            }) => content_view::show(ui, inspection, view_mode),
-            Some(_) => {}
-            None => self.welcome(ui),
-        });
+        self.editor(ctx);
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(
@@ -585,45 +819,179 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
     }
 
-    #[test]
-    fn uses_pitch_black_background() {
-        let ctx = egui::Context::default();
-        let _app = BogusMipsApp::with_context(&ctx, None);
-        let visuals = ctx.style().visuals.clone();
-        let expected = egui::Color32::BLACK;
-        assert_eq!(visuals.panel_fill, expected);
-        assert_eq!(visuals.window_fill, expected);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn draws_title_in_black_macos_title_bar() {
-        let ctx = egui::Context::default();
-        let mut app = BogusMipsApp::with_context(&ctx, None);
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1280.0, 800.0),
-            )),
-            ..Default::default()
-        };
-        let output = ctx.run(input, |ctx| app.ui(ctx));
-        let texts: Vec<(egui::Pos2, String)> = output
+    fn texts_of(output: &egui::FullOutput) -> Vec<(egui::Pos2, String)> {
+        output
             .shapes
             .iter()
             .filter_map(|c| match &c.shape {
                 egui::Shape::Text(t) => Some((t.pos, t.galley.text().to_owned())),
                 _ => None,
             })
+            .collect()
+    }
+
+    fn input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        vec![egui::Event::PointerMoved(pos), button(true), button(false)]
+    }
+
+    #[test]
+    fn uses_vscode_dark_palette() {
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let visuals = ctx.style().visuals.clone();
+        assert_eq!(
+            visuals.panel_fill,
+            egui::Color32::from_rgb(0x3c, 0x3c, 0x3c)
+        );
+        assert_eq!(visuals.extreme_bg_color, theme::INPUT);
+        assert_eq!(visuals.override_text_color, Some(theme::TEXT));
+
+        let output = ctx.run(input(vec![]), |ctx| app.ui(ctx));
+        let fills: Vec<egui::Color32> = output
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r) => Some(r.fill),
+                _ => None,
+            })
             .collect();
+        for color in [
+            theme::ACTIVITY_BAR,
+            theme::SIDEBAR,
+            theme::EDITOR,
+            theme::STATUS_BAR,
+            theme::BUTTON,
+        ] {
+            assert!(fills.contains(&color), "{color:?} not painted");
+        }
+        // Welcome views as in VS Code: explorer button and editor start page.
+        let texts = texts_of(&output);
+        for label in ["Explorer", "Open APK or XAPK", "Start", "Open APK or XAPK…"] {
+            assert!(texts.iter().any(|(_, t)| t == label), "{label} missing");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn draws_title_in_command_center() {
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
         let bar = theme::MACOS_TITLE_BAR_HEIGHT;
         let (title_pos, _) = texts.iter().find(|(_, t)| t == "BogusMips").expect("title");
         assert!(title_pos.y < bar && title_pos.x > 500.0, "{title_pos:?}");
-        let (file_pos, _) = texts.iter().find(|(_, t)| t == "File").expect("menu");
-        assert!(
-            file_pos.y >= bar,
-            "menu bar overlaps the title bar: {file_pos:?}"
+        // Clicking the command center opens the search view.
+        app.show_sidebar = false;
+        let _ = ctx.run(input(click(egui::pos2(640.0, bar / 2.0))), |ctx| {
+            app.ui(ctx)
+        });
+        assert!(app.show_sidebar && app.sidebar_view == SideView::Search);
+    }
+
+    #[test]
+    fn activity_bar_switches_and_hides_views() {
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let top = if cfg!(target_os = "macos") {
+            theme::MACOS_TITLE_BAR_HEIGHT
+        } else {
+            4.0
+        };
+        let search_icon = egui::pos2(ACTIVITY_BAR_WIDTH / 2.0, top + 4.0 + 44.0 * 2.5);
+        let _ = ctx.run(input(vec![]), |ctx| app.ui(ctx));
+        let _ = ctx.run(input(click(search_icon)), |ctx| app.ui(ctx));
+        assert_eq!(app.sidebar_view, SideView::Search);
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        assert!(texts.iter().any(|(_, t)| t == "Search"));
+        // Clicking the active view's icon hides the sidebar.
+        let _ = ctx.run(input(click(search_icon)), |ctx| app.ui(ctx));
+        assert!(!app.show_sidebar);
+    }
+
+    #[test]
+    fn search_opens_match_in_editor() {
+        let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+        let mut text = lines.join("\n");
+        text.push_str("\n    the secret_token is here\n");
+        let zip = crate::formats::zip::write_stored_zip(&[
+            ("assets/notes.txt", text.as_bytes()),
+            ("assets/other.txt", b"nothing to see"),
+        ]);
+        let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
+        let notes = node_named(&package, "notes.txt");
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        app.document = Some(Document::new(package));
+        app.show_view(&ctx, SideView::Search);
+
+        // Type into the focused search box.
+        let _ = ctx.run(input(vec![]), |ctx| app.ui(ctx));
+        let _ = ctx.run(
+            input(vec![egui::Event::Text("SECRET_token".into())]),
+            |ctx| app.ui(ctx),
         );
+        assert_eq!(
+            app.document.as_ref().unwrap().search.query.text,
+            "SECRET_token"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while app.document.as_ref().unwrap().search.results.is_none()
+            && std::time::Instant::now() < deadline
+        {
+            let _ = ctx.run(input(vec![]), |ctx| app.ui(ctx));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        assert!(
+            texts.iter().any(|(_, t)| t == "1 result in 1 file"),
+            "{texts:?}"
+        );
+        let (pos, _) = texts
+            .iter()
+            .find(|(_, t)| t == "the secret_token is here")
+            .unwrap_or_else(|| panic!("match preview not drawn: {texts:?}"));
+        let _ = ctx.run(input(click(*pos + egui::vec2(4.0, 4.0))), |ctx| app.ui(ctx));
+
+        let doc = app.document.as_ref().unwrap();
+        assert_eq!(doc.selected, Some(notes));
+        assert_eq!(
+            doc.goto.as_ref().map(|g| (g.line, g.range.clone())),
+            Some((200, 8..20))
+        );
+        // The editor scrolls to the match and shows the highlighted line.
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        let texts = if texts.iter().any(|(_, t)| t.contains("secret_token")) {
+            texts
+        } else {
+            texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)))
+        };
+        assert!(
+            texts.iter().any(|(_, t)| t == "201"),
+            "line number not visible"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(_, t)| t.contains("    the secret_token is here"))
+        );
+        assert!(!app.document.as_ref().unwrap().goto.as_ref().unwrap().scroll);
     }
 
     #[test]
@@ -661,14 +1029,7 @@ mod tests {
         let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
         let ctx = egui::Context::default();
         let mut app = BogusMipsApp::with_context(&ctx, None);
-        let tree = TreeState::new(&package);
-        let mut doc = Document {
-            package,
-            tree,
-            selected: None,
-            inspection: None,
-            view_mode: ViewMode::default(),
-        };
+        let mut doc = Document::new(package);
         select(&ctx, &mut doc, 0);
         app.document = Some(doc);
 
@@ -689,7 +1050,7 @@ mod tests {
                 ..Default::default()
             };
             let output = ctx.run(input, |ctx| app.ui(ctx));
-            widths.push((width(&ctx, "tree_panel"), width(&ctx, "info_panel")));
+            widths.push((width(&ctx, "sidebar"), width(&ctx, "info_panel")));
             texts = output
                 .shapes
                 .iter()
@@ -708,6 +1069,10 @@ mod tests {
                 "{label} not drawn: {texts:?}"
             );
         }
+        assert!(
+            widths[5].0.is_some() && widths[5].1.is_some(),
+            "panels not found"
+        );
         assert!(widths[5..].iter().all(|w| *w == widths[5]), "{widths:?}");
         // The filter row must sit at the top, leaving the space below for the tree.
         let filter = ctx
@@ -728,14 +1093,7 @@ mod tests {
             .unwrap();
         let ctx = egui::Context::default();
         let mut app = BogusMipsApp::with_context(&ctx, None);
-        let tree = TreeState::new(&package);
-        let mut doc = Document {
-            package,
-            tree,
-            selected: None,
-            inspection: None,
-            view_mode: ViewMode::default(),
-        };
+        let mut doc = Document::new(package);
         select(&ctx, &mut doc, 0);
         app.document = Some(doc);
         assert!(
@@ -793,14 +1151,7 @@ mod tests {
         let (js_node, json_node) = (node("app.min.js"), node("config.json"));
         let ctx = egui::Context::default();
         let mut app = BogusMipsApp::with_context(&ctx, None);
-        let tree = TreeState::new(&package);
-        app.document = Some(Document {
-            package,
-            tree,
-            selected: None,
-            inspection: None,
-            view_mode: ViewMode::default(),
-        });
+        app.document = Some(Document::new(package));
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let frame = |app: &mut BogusMipsApp| {
             let input = egui::RawInput {
@@ -867,15 +1218,9 @@ mod tests {
             log.borrow_mut().push(name.to_owned());
             Some(dir.join(name))
         });
-        let mut tree = TreeState::new(&package);
-        tree.reveal(&package, target);
-        app.document = Some(Document {
-            package,
-            tree,
-            selected: None,
-            inspection: None,
-            view_mode: ViewMode::default(),
-        });
+        let mut doc = Document::new(package);
+        doc.tree.reveal(&doc.package, target);
+        app.document = Some(doc);
 
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
         let run = |app: &mut BogusMipsApp, events: Vec<egui::Event>| {

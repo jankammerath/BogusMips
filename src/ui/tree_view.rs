@@ -12,9 +12,9 @@ const ROW_HEIGHT: f32 = 22.0;
 const INDENT: f32 = 12.0;
 const CHEVRON_WIDTH: f32 = 16.0;
 const LEFT_PADDING: f32 = 4.0;
-const SELECTED: Color32 = Color32::from_rgb(0x37, 0x37, 0x3d);
-const HOVERED: Color32 = Color32::from_rgb(0x2a, 0x2d, 0x2e);
-const GUIDE: Color32 = Color32::from_rgb(0x40, 0x40, 0x40);
+const SELECTED: Color32 = super::theme::LIST_SELECTED;
+const HOVERED: Color32 = super::theme::LIST_HOVER;
+const GUIDE: Color32 = Color32::from_rgb(0x58, 0x58, 0x58);
 const CHEVRON: Color32 = Color32::from_rgb(0xc5, 0xc5, 0xc5);
 pub const FILTER_ID: &str = "tree_filter";
 
@@ -105,7 +105,7 @@ fn flatten(
     rows
 }
 
-fn icon(pkg: &Package, id: NodeId, open: bool) -> (&'static str, Color32) {
+pub(crate) fn icon(pkg: &Package, id: NodeId, open: bool) -> (&'static str, Color32) {
     const FOLDER: Color32 = Color32::from_rgb(0xdc, 0xb6, 0x7a);
     const CODE: Color32 = Color32::from_rgb(0x4e, 0xc9, 0xb0);
     const GRAY: Color32 = Color32::from_rgb(0xa0, 0xa0, 0xa0);
@@ -143,7 +143,7 @@ fn icon(pkg: &Package, id: NodeId, open: bool) -> (&'static str, Color32) {
 }
 
 /// Draws a `›` (closed) or `⌄` (open) chevron centered at `center`.
-fn paint_chevron(painter: &egui::Painter, center: egui::Pos2, open: bool) {
+pub(crate) fn paint_chevron(painter: &egui::Painter, center: egui::Pos2, open: bool) {
     let points = if open {
         vec![
             center + vec2(-4.0, -2.0),
@@ -176,10 +176,7 @@ fn paint_row(
     let text_color = ui.visuals().text_color();
 
     let (label, label_font) = if is_root {
-        (
-            node.label.to_uppercase(),
-            super::theme::bold(body.size - 1.0),
-        )
+        (node.label.to_uppercase(), super::theme::bold(11.0))
     } else {
         (node.label.clone(), body.clone())
     };
@@ -237,6 +234,76 @@ pub struct TreeResponse {
     pub export: Option<(NodeId, ExportKind)>,
 }
 
+/// The filter input, styled like VS Code's inputs. Right-to-left, so the
+/// text field only takes the width left after the clear button (sizing it
+/// from the full width would push the panel wider on every frame); the
+/// surrounding `horizontal` limits the layout to a single row.
+fn filter_box(ui: &mut egui::Ui, state: &mut TreeState) {
+    let focused = ui.memory(|m| m.has_focus(egui::Id::new(FILTER_ID)));
+    egui::Frame::NONE
+        .fill(super::theme::INPUT)
+        .stroke(Stroke::new(
+            1.0,
+            if focused {
+                super::theme::FOCUS
+            } else {
+                super::theme::INPUT
+            },
+        ))
+        .corner_radius(2)
+        .inner_margin(egui::Margin {
+            left: 6,
+            right: 2,
+            top: 2,
+            bottom: 2,
+        })
+        .outer_margin(egui::Margin::symmetric(12, 0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !state.filter.is_empty()
+                        && super::icons::button(ui, super::icons::Icon::Close, 18.0, "Clear filter")
+                            .clicked()
+                    {
+                        state.filter.clear();
+                    }
+                    let edit = egui::TextEdit::singleline(&mut state.filter)
+                        .id(egui::Id::new(FILTER_ID))
+                        .frame(false)
+                        .hint_text("Filter files and classes")
+                        .desired_width(ui.available_width());
+                    ui.add(edit);
+                });
+            });
+        });
+}
+
+/// Explorer content when no package is open (VS Code's "no folder" view).
+/// Returns `true` if the open button was clicked.
+pub fn show_empty(ui: &mut egui::Ui) -> bool {
+    super::theme::view_title(ui, "Explorer");
+    let mut open = false;
+    egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(12, 4))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("NO PACKAGE OPENED")
+                    .size(11.0)
+                    .family(super::theme::bold_family()),
+            );
+            ui.add_space(10.0);
+            ui.label("You have not opened a package yet.");
+            ui.add_space(8.0);
+            open = super::theme::primary_button(ui, "Open APK or XAPK").clicked();
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new("You can also drop an .apk or .xapk file onto this window.")
+                    .color(super::theme::TEXT_DIM),
+            );
+        });
+    open
+}
+
 /// Shows the tree.
 pub fn show(
     ui: &mut egui::Ui,
@@ -247,36 +314,9 @@ pub fn show(
     let mut new_selection = None;
     let mut export_request = None;
 
-    ui.label(
-        egui::RichText::new("PACKAGE")
-            .small()
-            .family(super::theme::bold_family())
-            .color(ui.visuals().weak_text_color()),
-    );
-    ui.add_space(2.0);
-    // Right-to-left, so the text field only takes the width that is left after
-    // the clear button; sizing it from the full width would push the panel
-    // wider on every frame. The surrounding `horizontal` limits the layout to
-    // a single row (on its own it would fill the panel's whole height).
-    ui.horizontal(|ui| {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add_enabled(
-                    !state.filter.is_empty(),
-                    egui::Button::new("✖").frame(false),
-                )
-                .on_hover_text("Clear filter")
-                .clicked()
-            {
-                state.filter.clear();
-            }
-            let edit = egui::TextEdit::singleline(&mut state.filter)
-                .id(egui::Id::new(FILTER_ID))
-                .hint_text("🔍 Filter (⌘F)")
-                .desired_width(ui.available_width());
-            ui.add(edit);
-        });
-    });
+    super::theme::view_title(ui, "Explorer");
+    filter_box(ui, state);
+    ui.add_space(4.0);
 
     let expanded_snapshot = std::mem::take(&mut state.expanded);
     let (rows, matches) = match state.visible_mask(pkg) {
@@ -285,13 +325,15 @@ pub fn show(
     };
     state.expanded = expanded_snapshot;
     if let Some(matches) = matches {
-        ui.label(
-            egui::RichText::new(format!("{matches} matches"))
-                .small()
-                .color(ui.visuals().weak_text_color()),
-        );
+        ui.horizontal(|ui| {
+            ui.add_space(12.0);
+            ui.label(
+                egui::RichText::new(format!("{matches} matches"))
+                    .size(12.0)
+                    .color(super::theme::TEXT_DIM),
+            );
+        });
     }
-    ui.add_space(2.0);
 
     let row_height = ROW_HEIGHT;
     let selected_row = selected.and_then(|s| rows.iter().position(|(id, _)| *id == s));
