@@ -19,5 +19,5 @@ src/
 ├── app.rs         # application state and main UI loop
 └── ui/
     ├── mod.rs
-    └── theme.rs   # dark theme configuration
+    └── theme.rs   # dark theme (egui widgets + native window frame)
 ```

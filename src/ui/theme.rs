@@ -9,3 +9,10 @@ pub fn apply_dark(ctx: &egui::Context) {
         style.visuals.override_text_color = Some(Color32::from_rgb(0xe6, 0xe6, 0xe6));
     });
 }
+
+/// Forces the native window decorations (title bar / frame) into dark mode,
+/// independent of the OS appearance setting. Uses `NSAppearance` (darkAqua) on
+/// macOS and DWM immersive dark mode on Windows 10 1809+ / Windows 11.
+pub fn apply_dark_window_frame(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+}
