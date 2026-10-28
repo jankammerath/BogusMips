@@ -328,10 +328,14 @@ fn monospace_rows(
             area = area.horizontal_scroll_offset(left.max(0.0));
         }
     }
+    // The visible area. Not `clip_rect()`: egui widens scroll clip rects by
+    // `clip_rect_margin`, which would paint over the card's border.
+    let viewport = ui.available_rect_before_wrap();
     ui.scope(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        // Text scrolled under the gutter must not show beside it either.
+        ui.visuals_mut().clip_rect_margin = 0.0;
         area.show_rows(ui, row_height, count, |ui, range| {
-            let viewport = ui.clip_rect();
             for i in range {
                 let (gutter, mut job) = row(i, &font);
                 let target_range = target
@@ -447,6 +451,73 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The gutter background must stay inside the editor area, or it covers
+    /// the card's border (egui widens scroll clip rects by a few points).
+    #[test]
+    fn gutter_does_not_paint_outside_the_editor() {
+        let ctx = egui::Context::default();
+        crate::ui::theme::install_fonts(&ctx);
+        let inspection = Inspection {
+            node: 0,
+            title: "x".into(),
+            content: Content::Text {
+                lines: (0..50).map(|i| format!("line {i}")).collect(),
+                syntax: Syntax::Plain,
+            },
+            raw: None,
+            original: None,
+            sections: Vec::new(),
+        };
+        let mut mode = ViewMode::Preview;
+        let mut goto = Goto {
+            line: 3,
+            range: 0..4,
+            scroll: false,
+        };
+        let mut area = egui::Rect::NOTHING;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                area = ui.max_rect();
+                show(ui, Some(&inspection), &mut mode, Some(&mut goto), true);
+            });
+        });
+        let painted: Vec<egui::Rect> = output
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::Shape::Rect(r)
+                    if r.fill == theme::EDITOR || r.fill == theme::LINE_HIGHLIGHT =>
+                {
+                    Some(r.rect)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(painted.len() > 10, "gutter not painted");
+        for clipped in &output.shapes {
+            if matches!(clipped.shape, egui::Shape::Text(_)) && clipped.clip_rect.top() > 60.0 {
+                assert!(
+                    clipped.clip_rect.left() >= area.left(),
+                    "text may paint outside: {:?}",
+                    clipped.clip_rect
+                );
+            }
+        }
+        for rect in painted {
+            assert!(
+                rect.left() >= area.left() && rect.right() <= area.right(),
+                "{rect:?} outside {area:?}"
+            );
+        }
     }
 
     #[test]
