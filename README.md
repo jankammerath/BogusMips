@@ -1,6 +1,11 @@
 # BogusMips
 
+[![GitHub Sponsor](https://img.shields.io/badge/sponsor-30363D?style=flat&logo=GitHub-Sponsors&logoColor=ea4aaa)](https://github.com/sponsors/jankammerath)
+
 BogusMips is written in Rust and allows performing analyses on how far your Android app can be disassembled. It allows you to open the `*.apk` or `*.xapk` file of your app to see how far your app can be disassembled. 
+
+![Kotlin class](/screenshots/screenshot1.png)
+*Kotlin Android app with class and resource navigation*
 
 ## Features
 
