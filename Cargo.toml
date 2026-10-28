@@ -8,6 +8,11 @@ readme = "README.md"
 
 [dependencies]
 eframe = "0.32.3"
+egui_extras = { version = "0.32", features = ["image"] }
+flate2 = "1.1.10"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+rfd = "0.17.2"
+sha2 = "0.11.0"
 
 [profile.release]
 lto = true
