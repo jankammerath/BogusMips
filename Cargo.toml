@@ -1,0 +1,14 @@
+[package]
+name = "bogusmips"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Analyze how far an Android app (*.apk / *.aab) can be disassembled"
+readme = "README.md"
+
+[dependencies]
+eframe = "0.32.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
