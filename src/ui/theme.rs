@@ -1,14 +1,21 @@
 use eframe::egui::{self, Color32};
 
-/// Window and panel background, matching macOS dark mode.
-pub const BACKGROUND: Color32 = Color32::from_rgb(0x2f, 0x31, 0x33);
+/// Pitch black window and panel background.
+pub const BACKGROUND: Color32 = Color32::BLACK;
+pub const TEXT: Color32 = Color32::from_rgb(0xd4, 0xd4, 0xd4);
 
 pub fn apply_dark(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |style| {
-        style.visuals.panel_fill = BACKGROUND;
-        style.visuals.window_fill = BACKGROUND;
-        style.visuals.override_text_color = Some(Color32::from_rgb(0xe6, 0xe6, 0xe6));
+        let v = &mut style.visuals;
+        v.panel_fill = BACKGROUND;
+        v.window_fill = BACKGROUND;
+        v.faint_bg_color = Color32::from_rgb(0x0c, 0x0c, 0x0c);
+        // Inputs (e.g. the tree filter) stay slightly lifted off the black.
+        v.extreme_bg_color = Color32::from_rgb(0x1a, 0x1a, 0x1a);
+        // Panel separators.
+        v.widgets.noninteractive.bg_stroke.color = Color32::from_rgb(0x26, 0x26, 0x26);
+        v.override_text_color = Some(TEXT);
     });
 }
 

@@ -440,11 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn uses_macos_dark_background() {
+    fn uses_pitch_black_background() {
         let ctx = egui::Context::default();
         let _app = BogusMipsApp::with_context(&ctx, None);
         let visuals = ctx.style().visuals.clone();
-        let expected = egui::Color32::from_rgb(0x2f, 0x31, 0x33);
+        let expected = egui::Color32::BLACK;
         assert_eq!(visuals.panel_fill, expected);
         assert_eq!(visuals.window_fill, expected);
     }
@@ -523,7 +523,7 @@ mod tests {
                 .collect();
         }
         // The tree rows must be visible in the left panel.
-        for label in ["test.apk", "Source code", "Files"] {
+        for label in ["TEST.APK", "Source code", "Files"] {
             assert!(
                 texts
                     .iter()
@@ -538,6 +538,70 @@ mod tests {
             .expect("filter rendered");
         assert!(filter.rect.top() < 80.0, "filter at {:?}", filter.rect);
         assert!(filter.rect.height() < 40.0, "filter at {:?}", filter.rect);
+    }
+
+    #[test]
+    fn clicking_a_folder_row_selects_and_toggles_it() {
+        let zip = crate::formats::zip::write_stored_zip(&[("assets/readme.txt", b"hello")]);
+        let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
+        let files = package
+            .nodes
+            .iter()
+            .position(|n| n.label == "Files")
+            .unwrap();
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let tree = TreeState::new(&package);
+        let mut doc = Document {
+            package,
+            tree,
+            selected: None,
+            inspection: None,
+            view_mode: ViewMode::default(),
+        };
+        select(&ctx, &mut doc, 0);
+        app.document = Some(doc);
+        assert!(
+            app.document
+                .as_ref()
+                .unwrap()
+                .tree
+                .expanded
+                .contains(&files)
+        );
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let run = |app: &mut BogusMipsApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| app.ui(ctx))
+        };
+        let output = run(&mut app, vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Files" => {
+                    Some(t.pos + egui::vec2(4.0, 4.0))
+                }
+                _ => None,
+            })
+            .expect("Files row drawn");
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        run(&mut app, vec![egui::Event::PointerMoved(pos), button(true)]);
+        run(&mut app, vec![button(false)]);
+
+        let doc = app.document.as_ref().unwrap();
+        assert_eq!(doc.selected, Some(files));
+        assert!(!doc.tree.expanded.contains(&files));
     }
 
     /// Renders every node of a real package headlessly. Opt-in, as no APK

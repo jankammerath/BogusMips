@@ -2,15 +2,19 @@
 
 use std::collections::HashSet;
 
-use eframe::egui::{
-    self, Color32, Key, ScrollArea, Sense, TextWrapMode, collapsing_header::paint_default_icon,
-    text::LayoutJob,
-};
+use eframe::egui::{self, Color32, FontId, Key, ScrollArea, Sense, Shape, Stroke, pos2, vec2};
 
-use super::highlight::append;
 use crate::package::{NodeId, NodeKind, Package};
 
-const INDENT: f32 = 14.0;
+/// Row metrics and colors modelled on the VS Code explorer.
+const ROW_HEIGHT: f32 = 22.0;
+const INDENT: f32 = 12.0;
+const CHEVRON_WIDTH: f32 = 16.0;
+const LEFT_PADDING: f32 = 4.0;
+const SELECTED: Color32 = Color32::from_rgb(0x37, 0x37, 0x3d);
+const HOVERED: Color32 = Color32::from_rgb(0x2a, 0x2d, 0x2e);
+const GUIDE: Color32 = Color32::from_rgb(0x40, 0x40, 0x40);
+const CHEVRON: Color32 = Color32::from_rgb(0xc5, 0xc5, 0xc5);
 pub const FILTER_ID: &str = "tree_filter";
 
 pub struct TreeState {
@@ -133,6 +137,97 @@ fn icon(pkg: &Package, id: NodeId, open: bool) -> (&'static str, Color32) {
     }
 }
 
+/// Draws a `›` (closed) or `⌄` (open) chevron centered at `center`.
+fn paint_chevron(painter: &egui::Painter, center: egui::Pos2, open: bool) {
+    let points = if open {
+        vec![
+            center + vec2(-4.0, -2.0),
+            center + vec2(0.0, 2.0),
+            center + vec2(4.0, -2.0),
+        ]
+    } else {
+        vec![
+            center + vec2(-2.0, -4.0),
+            center + vec2(2.0, 0.0),
+            center + vec2(-2.0, 4.0),
+        ]
+    };
+    painter.add(Shape::line(points, Stroke::new(1.3, CHEVRON)));
+}
+
+/// Paints one explorer row (highlight, indent guides, chevron, icon, label)
+/// spanning the full width of the tree.
+fn paint_row(
+    ui: &mut egui::Ui,
+    pkg: &Package,
+    id: NodeId,
+    depth: usize,
+    open: bool,
+    selected: bool,
+) -> egui::Response {
+    let node = &pkg.nodes[id];
+    let is_root = node.parent.is_none();
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let text_color = ui.visuals().text_color();
+
+    let (label, label_font) = if is_root {
+        (
+            node.label.to_uppercase(),
+            FontId::proportional(body.size - 1.0),
+        )
+    } else {
+        (node.label.clone(), body.clone())
+    };
+    let painter = ui.painter().clone();
+    let label_galley = painter.layout_no_wrap(label, label_font, text_color);
+    let icon_galley = (!is_root).then(|| {
+        let (glyph, color) = icon(pkg, id, open);
+        painter.layout_no_wrap(glyph.to_owned(), body.clone(), color)
+    });
+
+    let left = ui.max_rect().left();
+    let chevron_x = left + LEFT_PADDING + depth as f32 * INDENT;
+    let icon_x = chevron_x + CHEVRON_WIDTH;
+    let text_x = icon_x + icon_galley.as_ref().map_or(0.0, |g| g.size().x + 6.0);
+    let width = (text_x + label_galley.size().x + 8.0 - left).max(ui.available_width());
+
+    let (rect, response) = ui.allocate_exact_size(vec2(width, ROW_HEIGHT), Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    if selected {
+        painter.rect_filled(rect, 0.0, SELECTED);
+    } else if response.hovered() {
+        painter.rect_filled(rect, 0.0, HOVERED);
+    }
+    for level in 1..depth {
+        let x = left + LEFT_PADDING + level as f32 * INDENT + CHEVRON_WIDTH / 2.0;
+        painter.line_segment(
+            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(1.0, GUIDE),
+        );
+    }
+    if node.kind.is_container() && !node.children.is_empty() {
+        paint_chevron(
+            &painter,
+            pos2(chevron_x + CHEVRON_WIDTH / 2.0, rect.center().y),
+            open,
+        );
+    }
+    let center_y = rect.center().y;
+    if let Some(g) = icon_galley {
+        let pos = pos2(icon_x, center_y - g.size().y / 2.0);
+        painter.galley(pos, g, text_color);
+    }
+    let pos = pos2(text_x, center_y - label_galley.size().y / 2.0);
+    if is_root {
+        // Faux bold: egui's default font has no bold face.
+        painter.galley(pos + vec2(0.5, 0.0), label_galley.clone(), text_color);
+    }
+    painter.galley(pos, label_galley, text_color);
+    response
+}
+
 /// Shows the tree. Returns the newly selected node, if the selection changed.
 pub fn show(
     ui: &mut egui::Ui,
@@ -142,6 +237,13 @@ pub fn show(
 ) -> Option<NodeId> {
     let mut new_selection = None;
 
+    ui.label(
+        egui::RichText::new("PACKAGE")
+            .small()
+            .strong()
+            .color(ui.visuals().weak_text_color()),
+    );
+    ui.add_space(2.0);
     // Right-to-left, so the text field only takes the width that is left after
     // the clear button; sizing it from the full width would push the panel
     // wider on every frame. The surrounding `horizontal` limits the layout to
@@ -181,8 +283,7 @@ pub fn show(
     }
     ui.add_space(2.0);
 
-    let row_height = ui.spacing().interact_size.y;
-    let spacing = ui.spacing().item_spacing.y;
+    let row_height = ROW_HEIGHT;
     let selected_row = selected.and_then(|s| rows.iter().position(|(id, _)| *id == s));
 
     // Keyboard navigation while no text field has focus.
@@ -221,7 +322,7 @@ pub fn show(
 
     let mut area = ScrollArea::both().id_salt("tree_scroll").auto_shrink(false);
     if let Some(row) = scroll_to {
-        let top = row as f32 * (row_height + spacing);
+        let top = row as f32 * row_height;
         let bottom = top + row_height;
         if top < state.scroll_offset {
             area = area.vertical_scroll_offset(top);
@@ -230,44 +331,23 @@ pub fn show(
         }
     }
 
-    let output = area.show_rows(ui, row_height, rows.len(), |ui, range| {
-        ui.style_mut().wrap_mode = Some(TextWrapMode::Extend);
-        for &(id, depth) in &rows[range] {
-            let node = &pkg.nodes[id];
-            let is_open = matches.is_some() || state.expanded.contains(&id);
-            ui.horizontal(|ui| {
-                ui.set_min_height(row_height);
-                ui.add_space(depth as f32 * INDENT);
-                let toggle_width = ui.spacing().icon_width;
-                if node.kind.is_container() && !node.children.is_empty() {
-                    let (_, resp) = ui
-                        .allocate_exact_size(egui::vec2(toggle_width, row_height), Sense::click());
-                    paint_default_icon(ui, if is_open { 1.0 } else { 0.0 }, &resp);
-                    if resp.clicked() && !state.expanded.remove(&id) {
-                        state.expanded.insert(id);
+    let output = ui
+        .scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            area.show_rows(ui, row_height, rows.len(), |ui, range| {
+                for &(id, depth) in &rows[range] {
+                    let open = matches.is_some() || state.expanded.contains(&id);
+                    let row = paint_row(ui, pkg, id, depth, open, selected == Some(id));
+                    if row.clicked() {
+                        new_selection = Some(id);
+                        if pkg.nodes[id].kind.is_container() && !state.expanded.remove(&id) {
+                            state.expanded.insert(id);
+                        }
                     }
-                } else {
-                    ui.add_space(toggle_width);
                 }
-
-                let (glyph, color) = icon(pkg, id, is_open);
-                let font = egui::TextStyle::Body.resolve(ui.style());
-                let mut job = LayoutJob::default();
-                append(&mut job, glyph, color, &font);
-                append(&mut job, " ", color, &font);
-                append(&mut job, &node.label, ui.visuals().text_color(), &font);
-
-                let resp = ui.add(egui::Button::selectable(selected == Some(id), job));
-                if resp.clicked() {
-                    new_selection = Some(id);
-                }
-                if resp.double_clicked() && node.kind.is_container() && !state.expanded.remove(&id)
-                {
-                    state.expanded.insert(id);
-                }
-            });
-        }
-    });
+            })
+        })
+        .inner;
     state.scroll_offset = output.state.offset.y;
     state.view_height = output.inner_rect.height();
 
