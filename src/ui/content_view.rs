@@ -314,7 +314,8 @@ fn monospace_rows(
     let font = TextStyle::Monospace.resolve(ui.style());
     let row_height = ui.fonts(|f| f.row_height(&font));
     let char_width = ui.fonts(|f| f.glyph_width(&font, '0'));
-    let gutter_width = gutter_chars as f32 * char_width + 2.0 * GUTTER_PADDING;
+    let gutter_width =
+        GUTTER_LEFT + gutter_chars.max(MIN_GUTTER_CHARS) as f32 * char_width + GUTTER_GAP;
     let target = goto.as_ref().map(|g| (g.line, g.range.clone()));
     let mut area = ScrollArea::both().id_salt(id).auto_shrink(false);
     if let Some(goto) = goto {
@@ -364,7 +365,7 @@ fn monospace_rows(
                 let painter = ui.painter();
                 painter.rect_filled(gutter_rect, 0.0, theme::EDITOR);
                 painter.text(
-                    egui::pos2(gutter_rect.right() - GUTTER_PADDING, gutter_rect.top()),
+                    egui::pos2(gutter_rect.right() - GUTTER_GAP, gutter_rect.top()),
                     egui::Align2::RIGHT_TOP,
                     gutter,
                     font.clone(),
@@ -379,7 +380,13 @@ fn monospace_rows(
     });
 }
 
-const GUTTER_PADDING: f32 = 8.0;
+/// Space before the line numbers.
+const GUTTER_LEFT: f32 = 12.0;
+/// Space between the line numbers and the code.
+const GUTTER_GAP: f32 = 22.0;
+/// Line numbers are right-aligned in at least this many digits, so short
+/// files do not start the code right at the edge.
+const MIN_GUTTER_CHARS: usize = 3;
 
 fn text_view(
     ui: &mut egui::Ui,
@@ -500,5 +507,12 @@ mod tests {
         );
         assert_eq!(number, number_after, "line number moved");
         assert!(number.x < code.x);
+        // The numbers keep clear of the left edge and of the code.
+        let number_galley_width = 8.0;
+        assert!(number.x >= GUTTER_LEFT, "{number:?}");
+        assert!(
+            code.x - (number.x + number_galley_width) >= GUTTER_GAP - 1.0,
+            "{number:?} {code:?}"
+        );
     }
 }

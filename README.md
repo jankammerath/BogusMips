@@ -4,8 +4,8 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
 
 ## Features
 
-- VS Code style interface (Dark+ colors): activity bar with the application menu (☰), **Explorer** and **Search** views, an editor with tab and breadcrumbs, a file information panel and a status bar.
-- Open an `*.apk` or `*.xapk` with **☰ → File → Open…** (⌘O / Ctrl+O), by dropping it onto the window, or as a command-line argument.
+- VS Code style interface (Dark+ colors): a sidebar card with **Explorer** and **Search** views, an editor with tab and breadcrumbs, a file information panel and a status bar. The **File** and **View** menus are in the macOS menu bar, and in the window's menu bar on Windows.
+- Open an `*.apk` or `*.xapk` with **File → Open…** (⌘O / Ctrl+O), by dropping it onto the window, or as a command-line argument.
 - **Left: package tree**
   - **Source code**: every class from all `classes*.dex` files, grouped by Java package and disassembled to smali.
   - **Resources**: `resources.arsc` decoded into the `res/values*/*.xml` files it was compiled from (strings, colors, dimens, styles, attrs, arrays, plurals, …) plus `public.xml` with every resource ID.
@@ -94,5 +94,6 @@ src/
     ├── info_panel.rs    # right panel
     ├── search_view.rs   # sidebar search view
     ├── icons.rs         # vector icons (codicon style)
+    ├── native_menu.rs   # native application menu (macOS menu bar, Windows menu bar)
     └── highlight.rs     # smali / XML syntax highlighting
 ```

@@ -12,7 +12,7 @@ use crate::ui::content_view::{self, Goto, ViewMode};
 use crate::ui::icons::{self, Icon};
 use crate::ui::search_view::{self, SearchAction, SearchViewState};
 use crate::ui::tree_view::{self, TreeState};
-use crate::ui::{info_panel, theme};
+use crate::ui::{MenuAction, info_panel, theme};
 
 const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
@@ -87,13 +87,67 @@ pub struct BogusMipsApp {
     show_info: bool,
     show_sidebar: bool,
     sidebar_view: SideView,
+    /// Where the activity bar icons were drawn (for tests).
+    activity_icons: Vec<(SideView, egui::Rect)>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    native_menu: Option<crate::ui::native_menu::NativeMenu>,
     native_theme_applied: bool,
     window_title: String,
 }
 
 impl BogusMipsApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
-        Self::with_context(&cc.egui_ctx, initial_file)
+        #[allow(unused_mut)]
+        let mut app = Self::with_context(&cc.egui_ctx, initial_file);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            app.native_menu = crate::ui::native_menu::NativeMenu::install(cc);
+        }
+        app
+    }
+
+    fn has_native_menu(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.native_menu.is_some()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            false
+        }
+    }
+
+    /// Handles native menu selections and keeps the menu's state current.
+    fn sync_native_menu(&mut self, ctx: &egui::Context) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            let state = (
+                self.primary_export().is_some(),
+                self.document.is_some(),
+                self.show_info,
+            );
+            let Some(menu) = &mut self.native_menu else {
+                return;
+            };
+            menu.update(state.0, state.1, state.2);
+            for action in menu.poll() {
+                self.perform(ctx, action);
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let _ = ctx;
+    }
+
+    fn perform(&mut self, ctx: &egui::Context, action: MenuAction) {
+        match action {
+            MenuAction::Open => self.pick_file(),
+            MenuAction::Export => self.request_primary_export(),
+            MenuAction::Close => self.close(ctx),
+            MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            MenuAction::ShowExplorer => self.show_view(ctx, SideView::Explorer),
+            MenuAction::ShowSearch => self.show_view(ctx, SideView::Search),
+            MenuAction::ToggleInfo => self.show_info = !self.show_info,
+        }
     }
 
     pub fn with_context(ctx: &egui::Context, initial_file: Option<PathBuf>) -> Self {
@@ -111,6 +165,9 @@ impl BogusMipsApp {
             show_info: true,
             show_sidebar: true,
             sidebar_view: SideView::Explorer,
+            activity_icons: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            native_menu: None,
             native_theme_applied: false,
             window_title: "BogusMips".to_owned(),
         }
@@ -357,84 +414,99 @@ impl BogusMipsApp {
         }
     }
 
-    /// The application menu (☰ in the activity bar).
+    /// The in-app menu, used where no native menu is available.
     fn app_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut action = None;
+        let mut entry = |ui: &mut egui::Ui,
+                         label: &str,
+                         enabled: bool,
+                         shortcut: Option<&KeyboardShortcut>,
+                         a: MenuAction| {
+            let mut button = egui::Button::new(label);
+            if let Some(shortcut) = shortcut {
+                button = button.shortcut_text(ctx.format_shortcut(shortcut));
+            }
+            if ui.add_enabled(enabled, button).clicked() {
+                action = Some(a);
+                ui.close();
+            }
+        };
+        let can_export = self.primary_export().is_some();
+        let has_document = self.document.is_some();
+        let info_label = if self.show_info {
+            "Hide File Information"
+        } else {
+            "Show File Information"
+        };
         ui.menu_button("File", |ui| {
-            if ui
-                .add(egui::Button::new("Open…").shortcut_text(ctx.format_shortcut(&OPEN)))
-                .clicked()
-            {
-                self.pick_file();
-            }
-            let can_export = self.primary_export().is_some();
-            if ui
-                .add_enabled(
-                    can_export,
-                    egui::Button::new("Export…").shortcut_text(ctx.format_shortcut(&EXPORT)),
-                )
-                .on_hover_text(
-                    "Export the selected item (also available by right-clicking it in the tree)",
-                )
-                .clicked()
-            {
-                self.request_primary_export();
-            }
-            if ui
-                .add_enabled(
-                    self.document.is_some(),
-                    egui::Button::new("Close").shortcut_text(ctx.format_shortcut(&CLOSE)),
-                )
-                .clicked()
-            {
-                self.close(ctx);
-            }
+            entry(ui, "Open…", true, Some(&OPEN), MenuAction::Open);
+            entry(ui, "Export…", can_export, Some(&EXPORT), MenuAction::Export);
             ui.separator();
-            if ui.button("Quit").clicked() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-            }
+            entry(ui, "Close", has_document, Some(&CLOSE), MenuAction::Close);
+            ui.separator();
+            entry(ui, "Exit", true, None, MenuAction::Quit);
         });
         ui.menu_button("View", |ui| {
-            if ui
-                .add(
-                    egui::Button::new("Explorer")
-                        .shortcut_text(ctx.format_shortcut(&SHOW_EXPLORER)),
-                )
-                .clicked()
-            {
-                self.show_view(ctx, SideView::Explorer);
-            }
-            if ui
-                .add(egui::Button::new("Search").shortcut_text(ctx.format_shortcut(&SHOW_SEARCH)))
-                .clicked()
-            {
-                self.show_view(ctx, SideView::Search);
-            }
+            entry(
+                ui,
+                "Explorer",
+                true,
+                Some(&SHOW_EXPLORER),
+                MenuAction::ShowExplorer,
+            );
+            entry(
+                ui,
+                "Search",
+                true,
+                Some(&SHOW_SEARCH),
+                MenuAction::ShowSearch,
+            );
             ui.separator();
-            let label = if self.show_info {
-                "Hide File Information"
-            } else {
-                "Show File Information"
-            };
-            if ui
-                .add(egui::Button::new(label).shortcut_text(ctx.format_shortcut(&TOGGLE_INFO)))
-                .clicked()
-            {
-                self.show_info = !self.show_info;
-            }
+            entry(
+                ui,
+                info_label,
+                true,
+                Some(&TOGGLE_INFO),
+                MenuAction::ToggleInfo,
+            );
         });
+        if let Some(action) = action {
+            self.perform(ctx, action);
+        }
     }
 
-    /// The icon column on the far left.
-    fn activity_bar(&mut self, ctx: &egui::Context) {
-        let item = |ui: &mut egui::Ui, icon: Icon, active: bool, tooltip: &str| {
-            let (rect, response) =
-                ui.allocate_exact_size(egui::vec2(ACTIVITY_BAR_WIDTH, 44.0), egui::Sense::click());
+    /// Menu bar at the top of the window when there is no native menu.
+    fn menu_bar(&mut self, ctx: &egui::Context) {
+        if self.has_native_menu() {
+            return;
+        }
+        egui::TopBottomPanel::top("menu_bar")
+            .show_separator_line(false)
+            .frame(
+                egui::Frame::NONE
+                    .fill(theme::WINDOW)
+                    .inner_margin(egui::Margin::symmetric(6, 2)),
+            )
+            .show(ctx, |ui| {
+                egui::MenuBar::new().ui(ui, |ui| self.app_menu(ui, ctx));
+            });
+    }
+
+    /// The icon column at the left edge of the sidebar card.
+    fn activity_items(&mut self, ui: &mut egui::Ui) -> Option<SideView> {
+        let mut clicked = None;
+        self.activity_icons.clear();
+        ui.add_space(4.0);
+        for (view, icon, tooltip) in [
+            (SideView::Explorer, Icon::Files, "Explorer (⇧⌘E)"),
+            (SideView::Search, Icon::Search, "Search (⇧⌘F)"),
+        ] {
+            let active = self.show_sidebar && self.sidebar_view == view;
+            let (rect, response) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 44.0), egui::Sense::click());
+            let square = egui::Rect::from_center_size(rect.center(), egui::vec2(36.0, 36.0));
             if active {
-                ui.painter().rect_filled(
-                    rect.shrink2(egui::vec2(6.0, 3.0)),
-                    6.0,
-                    theme::ACTIVITY_ACTIVE_BG,
-                );
+                ui.painter().rect_filled(square, 6.0, theme::PILL);
             }
             let color = if active || response.hovered() {
                 theme::ICON_ACTIVE
@@ -447,34 +519,12 @@ impl BogusMipsApp {
                 icon,
                 color,
             );
-            response.on_hover_text(tooltip)
-        };
-        let mut toggle = None;
-        egui::SidePanel::left("activity_bar")
-            .exact_width(ACTIVITY_BAR_WIDTH)
-            .resizable(false)
-            .show_separator_line(false)
-            .frame(egui::Frame::NONE.fill(theme::ACTIVITY_BAR))
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.add_space(4.0);
-                let menu = item(ui, Icon::Menu, false, "Application menu");
-                egui::Popup::menu(&menu).show(|ui| {
-                    ui.set_min_width(160.0);
-                    self.app_menu(ui, ctx);
-                });
-                let explorer = self.show_sidebar && self.sidebar_view == SideView::Explorer;
-                if item(ui, Icon::Files, explorer, "Explorer (⇧⌘E)").clicked() {
-                    toggle = Some(SideView::Explorer);
-                }
-                let search = self.show_sidebar && self.sidebar_view == SideView::Search;
-                if item(ui, Icon::Search, search, "Search (⇧⌘F)").clicked() {
-                    toggle = Some(SideView::Search);
-                }
-            });
-        if let Some(view) = toggle {
-            self.toggle_view(ctx, view);
+            self.activity_icons.push((view, rect));
+            if response.on_hover_text(tooltip).clicked() {
+                clicked = Some(view);
+            }
         }
+        clicked
     }
 
     fn status_bar(&self, ctx: &egui::Context) {
@@ -547,33 +597,78 @@ impl BogusMipsApp {
         }
     }
 
+    /// The left card: activity icons, plus the Explorer or Search view
+    /// when the sidebar is shown.
     fn sidebar(&mut self, ctx: &egui::Context) {
         let mut pick = false;
         let mut search_action = None;
-        egui::SidePanel::left("sidebar")
-            .resizable(true)
-            .default_width(300.0)
-            .min_width(200.0)
+        let mut toggle = None;
+        let panel = if self.show_sidebar {
+            egui::SidePanel::left("sidebar")
+                .resizable(true)
+                .default_width(ACTIVITY_BAR_WIDTH + 300.0)
+                .min_width(ACTIVITY_BAR_WIDTH + 200.0)
+        } else {
+            egui::SidePanel::left("activity_only")
+                .resizable(false)
+                .exact_width(ACTIVITY_BAR_WIDTH + 2.0)
+        };
+        panel
             .show_separator_line(false)
             .frame(theme::card(theme::SIDEBAR))
-            .show(ctx, |ui| match (self.sidebar_view, &mut self.document) {
-                (SideView::Explorer, Some(doc)) => {
-                    let response = tree_view::show(ui, &doc.package, &mut doc.tree, doc.selected);
-                    if let Some(node) = response.selected {
-                        select(ctx, doc, node);
-                    }
-                    if response.export.is_some() {
-                        self.pending_export = response.export;
-                    }
+            .show(ctx, |ui| {
+                let full = ui.max_rect();
+                ui.expand_to_include_rect(full);
+                let bar = egui::Rect::from_min_size(
+                    full.min,
+                    egui::vec2(ACTIVITY_BAR_WIDTH.min(full.width()), full.height()),
+                );
+                let mut bar_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(bar)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                bar_ui.spacing_mut().item_spacing.y = 0.0;
+                toggle = self.activity_items(&mut bar_ui);
+                if !self.show_sidebar {
+                    return;
                 }
-                (SideView::Explorer, None) => pick = tree_view::show_empty(ui),
-                (SideView::Search, doc) => {
-                    let doc = doc
-                        .as_mut()
-                        .map(|d| (&*d.package, &mut d.search, &mut d.search_view));
-                    search_action = search_view::show(ui, doc);
+                ui.painter().vline(
+                    bar.right(),
+                    full.y_range(),
+                    egui::Stroke::new(1.0, theme::CARD_BORDER),
+                );
+                let content =
+                    egui::Rect::from_min_max(egui::pos2(bar.right() + 1.0, full.top()), full.max);
+                let mut ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(content)
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                );
+                let ui = &mut ui;
+                match (self.sidebar_view, &mut self.document) {
+                    (SideView::Explorer, Some(doc)) => {
+                        let response =
+                            tree_view::show(ui, &doc.package, &mut doc.tree, doc.selected);
+                        if let Some(node) = response.selected {
+                            select(ctx, doc, node);
+                        }
+                        if response.export.is_some() {
+                            self.pending_export = response.export;
+                        }
+                    }
+                    (SideView::Explorer, None) => pick = tree_view::show_empty(ui),
+                    (SideView::Search, doc) => {
+                        let doc = doc
+                            .as_mut()
+                            .map(|d| (&*d.package, &mut d.search, &mut d.search_view));
+                        search_action = search_view::show(ui, doc);
+                    }
                 }
             });
+        if let Some(view) = toggle {
+            self.toggle_view(ctx, view);
+        }
         match search_action {
             Some(SearchAction::Open { node, line, range }) => {
                 if let Some(doc) = &mut self.document {
@@ -760,12 +855,11 @@ impl BogusMipsApp {
         }
 
         // Panel order matters: full-width bars first, then the columns.
+        self.sync_native_menu(ctx);
         self.title_bar(ctx);
+        self.menu_bar(ctx);
         self.status_bar(ctx);
-        self.activity_bar(ctx);
-        if self.show_sidebar {
-            self.sidebar(ctx);
-        }
+        self.sidebar(ctx);
         if self.document.is_some() && self.show_info {
             self.info_panel(ctx);
         }
@@ -873,7 +967,6 @@ mod tests {
             })
             .collect();
         for color in [
-            theme::ACTIVITY_BAR,
             theme::SIDEBAR,
             theme::EDITOR,
             theme::STATUS_BAR,
@@ -905,24 +998,72 @@ mod tests {
         assert!(app.show_sidebar && app.sidebar_view == SideView::Search);
     }
 
+    fn icon_pos(app: &BogusMipsApp, view: SideView) -> egui::Pos2 {
+        app.activity_icons
+            .iter()
+            .find(|(v, _)| *v == view)
+            .map(|(_, r)| r.center())
+            .expect("activity icon drawn")
+    }
+
     #[test]
     fn activity_bar_switches_and_hides_views() {
         let ctx = egui::Context::default();
         let mut app = BogusMipsApp::with_context(&ctx, None);
-        let top = if cfg!(target_os = "macos") {
-            theme::MACOS_TITLE_BAR_HEIGHT
-        } else {
-            4.0
-        };
-        let search_icon = egui::pos2(ACTIVITY_BAR_WIDTH / 2.0, top + 4.0 + 44.0 * 2.5);
         let _ = ctx.run(input(vec![]), |ctx| app.ui(ctx));
-        let _ = ctx.run(input(click(search_icon)), |ctx| app.ui(ctx));
+        let sidebar_width = |ctx: &egui::Context, id: &str| {
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new(id)).map(|s| s.rect)
+        };
+
+        // The icons live inside the sidebar card, at its left edge.
+        let card = sidebar_width(&ctx, "sidebar").expect("sidebar card");
+        let search = icon_pos(&app, SideView::Search);
+        assert!(card.contains(search) && search.x < card.left() + ACTIVITY_BAR_WIDTH);
+
+        let _ = ctx.run(input(click(search)), |ctx| app.ui(ctx));
         assert_eq!(app.sidebar_view, SideView::Search);
         let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
         assert!(texts.iter().any(|(_, t)| t == "Search"));
-        // Clicking the active view's icon hides the sidebar.
-        let _ = ctx.run(input(click(search_icon)), |ctx| app.ui(ctx));
+
+        // Clicking the active view's icon collapses the card to the icons.
+        let _ = ctx.run(input(click(icon_pos(&app, SideView::Search))), |ctx| {
+            app.ui(ctx)
+        });
         assert!(!app.show_sidebar);
+        let _ = ctx.run(input(vec![]), |ctx| app.ui(ctx));
+        let collapsed = sidebar_width(&ctx, "activity_only").expect("collapsed card");
+        assert!(
+            collapsed.width() < ACTIVITY_BAR_WIDTH + 12.0,
+            "{collapsed:?}"
+        );
+        let explorer = icon_pos(&app, SideView::Explorer);
+        assert!(collapsed.contains(explorer));
+        let _ = ctx.run(input(click(explorer)), |ctx| app.ui(ctx));
+        assert!(app.show_sidebar && app.sidebar_view == SideView::Explorer);
+    }
+
+    #[test]
+    fn fallback_menu_bar_without_native_menu() {
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        let (file, _) = texts.iter().find(|(_, t)| t == "File").expect("File menu");
+        assert!(texts.iter().any(|(_, t)| t == "View"));
+        // Open the View menu and toggle the file information panel.
+        let (view, _) = texts.iter().find(|(_, t)| t == "View").unwrap();
+        let _ = ctx.run(input(click(*view + egui::vec2(4.0, 4.0))), |ctx| {
+            app.ui(ctx)
+        });
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        let (item, _) = texts
+            .iter()
+            .find(|(_, t)| t == "Hide File Information")
+            .expect("menu opened");
+        let _ = ctx.run(input(click(*item + egui::vec2(4.0, 4.0))), |ctx| {
+            app.ui(ctx)
+        });
+        assert!(!app.show_info);
+        let _ = file;
     }
 
     #[test]
@@ -1078,7 +1219,8 @@ mod tests {
         let filter = ctx
             .read_response(egui::Id::new(crate::ui::tree_view::FILTER_ID))
             .expect("filter rendered");
-        assert!(filter.rect.top() < 80.0, "filter at {:?}", filter.rect);
+        // At the top under the title/menu bar, not centered in the panel.
+        assert!(filter.rect.top() < 130.0, "filter at {:?}", filter.rect);
         assert!(filter.rect.height() < 40.0, "filter at {:?}", filter.rect);
     }
 

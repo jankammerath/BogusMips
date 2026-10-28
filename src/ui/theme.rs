@@ -8,8 +8,6 @@ use eframe::egui::{
 /// Window frame: title bar and the gaps between the cards.
 pub const WINDOW: Color32 = Color32::from_rgb(0x3c, 0x3c, 0x3c);
 pub const BACKGROUND: Color32 = WINDOW;
-pub const ACTIVITY_BAR: Color32 = Color32::from_rgb(0x33, 0x33, 0x33);
-pub const ACTIVITY_ACTIVE_BG: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x1e);
 pub const ICON_ACTIVE: Color32 = Color32::WHITE;
 pub const ICON_INACTIVE: Color32 = Color32::from_rgb(0x85, 0x85, 0x85);
 pub const SIDEBAR: Color32 = Color32::from_rgb(0x25, 0x25, 0x26);
@@ -47,6 +45,13 @@ pub fn card(fill: Color32) -> egui::Frame {
         .fill(fill)
         .stroke(Stroke::new(1.0, CARD_BORDER))
         .corner_radius(CornerRadius::same(CARD_RADIUS))
+        // Keeps content off the border and out of the rounded corners.
+        .inner_margin(Margin {
+            left: 1,
+            right: 1,
+            top: 1,
+            bottom: 4,
+        })
         .outer_margin(Margin {
             left: GAP,
             right: GAP,
