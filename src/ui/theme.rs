@@ -1,11 +1,13 @@
 use eframe::egui::{self, Color32};
 
+/// Window and panel background, matching macOS dark mode.
+pub const BACKGROUND: Color32 = Color32::from_rgb(0x2f, 0x31, 0x33);
+
 pub fn apply_dark(ctx: &egui::Context) {
     ctx.set_theme(egui::Theme::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |style| {
-        let bg = Color32::from_rgb(0x1e, 0x1e, 0x22);
-        style.visuals.panel_fill = bg;
-        style.visuals.window_fill = bg;
+        style.visuals.panel_fill = BACKGROUND;
+        style.visuals.window_fill = BACKGROUND;
         style.visuals.override_text_color = Some(Color32::from_rgb(0xe6, 0xe6, 0xe6));
     });
 }

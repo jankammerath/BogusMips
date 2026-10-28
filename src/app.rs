@@ -346,6 +346,10 @@ impl eframe::App for BogusMipsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ui(ctx);
     }
+
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::BACKGROUND.to_normalized_gamma_f32()
+    }
 }
 
 impl BogusMipsApp {
@@ -433,6 +437,16 @@ mod tests {
 
     fn frame(ctx: &egui::Context, app: &mut BogusMipsApp) {
         let _ = ctx.run(egui::RawInput::default(), |ctx| app.ui(ctx));
+    }
+
+    #[test]
+    fn uses_macos_dark_background() {
+        let ctx = egui::Context::default();
+        let _app = BogusMipsApp::with_context(&ctx, None);
+        let visuals = ctx.style().visuals.clone();
+        let expected = egui::Color32::from_rgb(0x2f, 0x31, 0x33);
+        assert_eq!(visuals.panel_fill, expected);
+        assert_eq!(visuals.window_fill, expected);
     }
 
     #[test]
