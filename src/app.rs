@@ -457,6 +457,75 @@ mod tests {
         frame(&ctx, &mut app);
     }
 
+    #[test]
+    fn panels_keep_their_width_while_the_pointer_moves() {
+        let zip = crate::formats::zip::write_stored_zip(&[
+            ("AndroidManifest.xml", b"x"),
+            (
+                "res/layout/a_rather_long_file_name_for_testing.xml",
+                b"<a/>",
+            ),
+            ("assets/readme.txt", b"hello"),
+        ]);
+        let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let tree = TreeState::new(&package);
+        let mut doc = Document {
+            package,
+            tree,
+            selected: None,
+            inspection: None,
+            view_mode: ViewMode::default(),
+        };
+        select(&ctx, &mut doc, 0);
+        app.document = Some(doc);
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let width = |ctx: &egui::Context, id: &str| {
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new(id))
+                .map(|s| s.rect.width())
+        };
+        let mut widths = Vec::new();
+        let mut texts: Vec<(egui::Pos2, String)> = Vec::new();
+        for i in 0..60 {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events: vec![egui::Event::PointerMoved(egui::pos2(
+                    (i * 20) as f32,
+                    (i * 13 % 800) as f32,
+                ))],
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| app.ui(ctx));
+            widths.push((width(&ctx, "tree_panel"), width(&ctx, "info_panel")));
+            texts = output
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some((t.pos, t.galley.text().to_owned())),
+                    _ => None,
+                })
+                .collect();
+        }
+        // The tree rows must be visible in the left panel.
+        for label in ["test.apk", "Source code", "Files"] {
+            assert!(
+                texts
+                    .iter()
+                    .any(|(pos, t)| t.contains(label) && pos.x < 320.0 && pos.y < 200.0),
+                "{label} not drawn: {texts:?}"
+            );
+        }
+        assert!(widths[5..].iter().all(|w| *w == widths[5]), "{widths:?}");
+        // The filter row must sit at the top, leaving the space below for the tree.
+        let filter = ctx
+            .read_response(egui::Id::new(crate::ui::tree_view::FILTER_ID))
+            .expect("filter rendered");
+        assert!(filter.rect.top() < 80.0, "filter at {:?}", filter.rect);
+        assert!(filter.rect.height() < 40.0, "filter at {:?}", filter.rect);
+    }
+
     /// Renders every node of a real package headlessly. Opt-in, as no APK
     /// ships with the repository: `BOGUSMIPS_TEST_APK=app.apk cargo test`.
     #[test]

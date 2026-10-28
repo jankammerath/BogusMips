@@ -142,22 +142,28 @@ pub fn show(
 ) -> Option<NodeId> {
     let mut new_selection = None;
 
+    // Right-to-left, so the text field only takes the width that is left after
+    // the clear button; sizing it from the full width would push the panel
+    // wider on every frame. The surrounding `horizontal` limits the layout to
+    // a single row (on its own it would fill the panel's whole height).
     ui.horizontal(|ui| {
-        let edit = egui::TextEdit::singleline(&mut state.filter)
-            .id(egui::Id::new(FILTER_ID))
-            .hint_text("🔍 Filter (⌘F)")
-            .desired_width(ui.available_width() - 28.0);
-        ui.add(edit);
-        if ui
-            .add_enabled(
-                !state.filter.is_empty(),
-                egui::Button::new("✖").frame(false),
-            )
-            .on_hover_text("Clear filter")
-            .clicked()
-        {
-            state.filter.clear();
-        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .add_enabled(
+                    !state.filter.is_empty(),
+                    egui::Button::new("✖").frame(false),
+                )
+                .on_hover_text("Clear filter")
+                .clicked()
+            {
+                state.filter.clear();
+            }
+            let edit = egui::TextEdit::singleline(&mut state.filter)
+                .id(egui::Id::new(FILTER_ID))
+                .hint_text("🔍 Filter (⌘F)")
+                .desired_width(ui.available_width());
+            ui.add(edit);
+        });
     });
 
     let expanded_snapshot = std::mem::take(&mut state.expanded);
