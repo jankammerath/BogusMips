@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 use super::reader::{Reader, Result, err, read_u16, read_u32};
+use super::resvalue::{Resolver, TYPE_STRING, format_value};
 
 const RES_STRING_POOL_TYPE: u16 = 0x0001;
 const RES_XML_TYPE: u16 = 0x0003;
@@ -70,34 +71,7 @@ pub fn is_binary_xml(data: &[u8]) -> bool {
     data.len() >= 8 && data[0..2] == [0x03, 0x00] && data[2..4] == [0x08, 0x00]
 }
 
-/// Android framework attribute IDs, used when obfuscators strip attribute
-/// names from the string pool (Android itself resolves attributes by ID).
-fn android_attr_name(id: u32) -> Option<&'static str> {
-    Some(match id {
-        0x0101_0000 => "theme",
-        0x0101_0001 => "label",
-        0x0101_0002 => "icon",
-        0x0101_0003 => "name",
-        0x0101_0006 => "permission",
-        0x0101_000e => "enabled",
-        0x0101_000f => "debuggable",
-        0x0101_0010 => "exported",
-        0x0101_0011 => "process",
-        0x0101_0018 => "authorities",
-        0x0101_0024 => "value",
-        0x0101_0025 => "resource",
-        0x0101_020c => "minSdkVersion",
-        0x0101_021b => "versionCode",
-        0x0101_021c => "versionName",
-        0x0101_0270 => "targetSdkVersion",
-        0x0101_0280 => "allowBackup",
-        0x0101_0572 => "compileSdkVersion",
-        0x0101_0573 => "compileSdkVersionCodename",
-        _ => return None,
-    })
-}
-
-fn parse_string_pool(data: &[u8], start: usize, size: usize) -> Result<Vec<String>> {
+pub(crate) fn parse_string_pool(data: &[u8], start: usize, size: usize) -> Result<Vec<String>> {
     let mut r = Reader::at(data, start)?;
     r.skip(2)?;
     let header_size = usize::from(r.u16()?);
@@ -149,53 +123,13 @@ fn read_pool_string(data: &[u8], pos: usize, utf8: bool) -> Result<String> {
     }
 }
 
-fn complex_to_float(data: u32) -> f64 {
-    const RADIX_MULTS: [f64; 4] = [
-        1.0 / 256.0,
-        1.0 / 256.0 / 128.0,
-        1.0 / 256.0 / 32768.0,
-        1.0 / 256.0 / 8_388_608.0,
-    ];
-    let mantissa = f64::from((data & 0xffff_ff00) as i32);
-    mantissa * RADIX_MULTS[((data >> 4) & 0x3) as usize]
-}
-
-fn trim_float(v: f64) -> String {
-    let s = format!("{v:.4}");
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    s.to_owned()
-}
-
-fn format_typed_value(data_type: u8, data: u32, strings: &[String]) -> String {
-    match data_type {
-        0x00 => String::new(),
-        0x01 | 0x07 => match data {
-            0 => "@null".to_owned(),
-            d if d >> 24 == 0x01 => format!("@android:0x{d:08x}"),
-            d => format!("@0x{d:08x}"),
-        },
-        0x02 | 0x08 => format!("?0x{data:08x}"),
-        0x03 => strings.get(data as usize).cloned().unwrap_or_default(),
-        0x04 => trim_float(f64::from(f32::from_bits(data))),
-        0x05 => {
-            const UNITS: [&str; 6] = ["px", "dp", "sp", "pt", "in", "mm"];
-            let unit = UNITS.get((data & 0xf) as usize).copied().unwrap_or("?");
-            format!("{}{unit}", trim_float(complex_to_float(data)))
-        }
-        0x06 => {
-            let unit = if data & 0xf == 0 { "%" } else { "%p" };
-            format!("{}{unit}", trim_float(complex_to_float(data) * 100.0))
-        }
-        0x10 => (data as i32).to_string(),
-        0x11 => format!("0x{data:x}"),
-        0x12 => (data != 0).to_string(),
-        0x1c | 0x1e => format!("#{data:08x}"),
-        0x1d | 0x1f => format!("#{:06x}", data & 0x00ff_ffff),
-        t => format!("0x{data:08x} (type 0x{t:02x})"),
-    }
-}
-
 pub fn parse(data: &[u8]) -> Result<XmlDocument> {
+    parse_with(data, &Resolver::default())
+}
+
+/// Decodes binary XML, naming resource references (`@string/app_name`) and
+/// enum/flag attribute values via `resolver`.
+pub fn parse_with(data: &[u8], resolver: &Resolver) -> Result<XmlDocument> {
     if !is_binary_xml(data) {
         return err("not an Android binary XML file");
     }
@@ -303,18 +237,22 @@ pub fn parse(data: &[u8]) -> Result<XmlDocument> {
 
                     let resource_id = resource_ids.get(name_idx as usize).copied();
                     let mut attr_name = str_at(&strings, name_idx);
+                    // Android resolves attributes by resource ID, so obfuscators
+                    // may strip or fake the names; recover them from the ID.
+                    let resource_id = resource_id.filter(|&id| id != 0);
                     if attr_name.is_empty() {
                         attr_name = match resource_id {
-                            Some(id) => android_attr_name(id)
-                                .map(str::to_owned)
+                            Some(id) => resolver
+                                .attr_name(id)
+                                .map(|n| n.rsplit(':').next().unwrap_or(&n).to_owned())
                                 .unwrap_or_else(|| format!("attr_0x{id:08x}")),
                             None => format!("attr_{name_idx}"),
                         };
                     }
-                    let value = if data_type == 0x03 && raw_value != NO_INDEX {
+                    let value = if data_type == TYPE_STRING && raw_value != NO_INDEX {
                         str_at(&strings, raw_value)
                     } else {
-                        format_typed_value(data_type, value_data, &strings)
+                        format_value(data_type, value_data, &strings, resolver, resource_id)
                     };
                     element.attributes.push(XmlAttribute {
                         prefix: prefix_for(attr_ns).filter(|p| !p.is_empty()),
@@ -570,14 +508,5 @@ mod tests {
             0x03, 0x00, 0x08, 0x00, 0xff, 0, 0, 0, 1, 0, 0x1c, 0, 0xff, 0xff, 0, 0,
         ]);
         assert!(doc.is_ok_and(|d| d.roots.is_empty() && !d.warnings.is_empty()));
-    }
-
-    #[test]
-    fn typed_values() {
-        assert_eq!(format_typed_value(0x12, 0xffff_ffff, &[]), "true");
-        assert_eq!(format_typed_value(0x1c, 0xff00_ff00, &[]), "#ff00ff00");
-        assert_eq!(format_typed_value(0x01, 0x7f01_0001, &[]), "@0x7f010001");
-        // 16dp: mantissa 16 << 8, radix 0, unit dp (1)
-        assert_eq!(format_typed_value(0x05, (16 << 8) | 1, &[]), "16dp");
     }
 }

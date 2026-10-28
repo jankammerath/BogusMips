@@ -111,6 +111,10 @@ fn icon(pkg: &Package, id: NodeId, open: bool) -> (&'static str, Color32) {
     match &pkg.nodes[id].kind {
         NodeKind::Archive(_) => ("📦", Color32::from_rgb(0xc5, 0x86, 0xc0)),
         NodeKind::SourceRoot(_) => ("☕", CODE),
+        NodeKind::ResourcesRoot(_) => ("🎨", Color32::from_rgb(0xce, 0x91, 0x78)),
+        NodeKind::ResourceDir(..) if open => ("📂", FOLDER),
+        NodeKind::ResourceDir(..) => ("📁", FOLDER),
+        NodeKind::ResourceFile(..) => ("📝", Color32::from_rgb(0xdc, 0xdc, 0xaa)),
         NodeKind::FilesRoot(_) => ("🗄", FOLDER),
         NodeKind::Folder(_) if open => ("📂", FOLDER),
         NodeKind::Folder(_) => ("📁", FOLDER),

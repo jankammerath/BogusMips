@@ -3,11 +3,13 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
+use crate::formats::arsc::{ResourceTable, ValuesSource};
 use crate::formats::axml;
 use crate::formats::detect::{FileKind, detect};
 use crate::formats::dex::access::{Target, flags_to_string};
 use crate::formats::dex::smali::class_to_smali;
 use crate::formats::dex::{DexFile, descriptor_to_java};
+use crate::formats::resvalue::Resolver;
 use crate::package::{
     ArchiveId, ClassRef, FileId, ManifestInfo, NodeId, NodeKind, Package, PackageKind, sha256_hex,
     to_hex,
@@ -113,6 +115,9 @@ pub fn inspect(pkg: &Package, node: NodeId) -> Inspection {
     match &pkg.nodes[node].kind {
         NodeKind::Archive(a) => inspect_archive(pkg, *a, &mut inspection),
         NodeKind::SourceRoot(a) => inspect_source_root(pkg, *a, &mut inspection),
+        NodeKind::ResourcesRoot(a) => inspect_resources_root(pkg, *a, &mut inspection),
+        NodeKind::ResourceDir(a, dir) => inspect_resource_dir(pkg, node, *a, dir, &mut inspection),
+        NodeKind::ResourceFile(a, i) => inspect_resource_file(pkg, *a, *i, &mut inspection),
         NodeKind::FilesRoot(_) | NodeKind::Folder(_) => inspect_folder(pkg, node, &mut inspection),
         NodeKind::JavaPackage(name) => inspect_package(pkg, node, name, &mut inspection),
         NodeKind::File(f) => inspect_file(pkg, node, *f, &mut inspection),
@@ -289,6 +294,114 @@ fn inspect_source_root(pkg: &Package, archive: ArchiveId, out: &mut Inspection) 
     out.content = Content::text(&text, Syntax::Plain);
 }
 
+fn resources_section(table: &ResourceTable) -> InfoSection {
+    let mut s = InfoSection::new("Resource table");
+    for p in &table.packages {
+        s.row("Package", format!("0x{:02x} {}", p.id, p.name));
+    }
+    let configs: usize = table
+        .packages
+        .iter()
+        .flat_map(|p| &p.types)
+        .map(|t| t.configs.len())
+        .sum();
+    s.row("Resources", group_digits(table.entry_count()))
+        .row(
+            "Types",
+            table
+                .packages
+                .iter()
+                .map(|p| p.types.len())
+                .sum::<usize>()
+                .to_string(),
+        )
+        .row("Type configurations", group_digits(configs))
+        .row("Strings", group_digits(table.strings.len()));
+    for w in &table.warnings {
+        s.row("⚠", w.clone());
+    }
+    s
+}
+
+fn inspect_resources_root(pkg: &Package, archive: ArchiveId, out: &mut Inspection) {
+    let a = &pkg.archives[archive];
+    let Some(table) = &a.resources else {
+        out.content = Content::Message("No resource table.".to_owned());
+        return;
+    };
+    let mut text = table.summary();
+    text += &format!(
+        "\n{} value files generated in {} directories (select one to view it).\n",
+        a.values_files.len(),
+        {
+            let mut dirs: Vec<&str> = a.values_files.iter().map(|f| f.dir.as_str()).collect();
+            dirs.sort_unstable();
+            dirs.dedup();
+            dirs.len()
+        }
+    );
+    out.content = Content::text(&text, Syntax::Plain);
+    out.sections.push(resources_section(table));
+}
+
+fn inspect_resource_dir(
+    pkg: &Package,
+    node: NodeId,
+    archive: ArchiveId,
+    dir: &str,
+    out: &mut Inspection,
+) {
+    let qualifiers = dir
+        .rsplit('/')
+        .next()
+        .and_then(|d| d.strip_prefix("values-"))
+        .unwrap_or("(default)");
+    let files = pkg.nodes[node].children.len();
+    let mut s = InfoSection::new("Resource directory");
+    s.row("Path", format!("res/{dir}/"))
+        .row("Qualifiers", qualifiers.to_owned())
+        .row("Files", files.to_string())
+        .row("Archive", pkg.archives[archive].name.clone());
+    out.sections.push(s);
+    out.content = Content::Message(format!(
+        "res/{dir}/\n{files} files generated from resources.arsc\n\nSelect a file to view it."
+    ));
+}
+
+fn inspect_resource_file(pkg: &Package, archive: ArchiveId, index: usize, out: &mut Inspection) {
+    let a = &pkg.archives[archive];
+    let (Some(table), Some(file)) = (&a.resources, a.values_files.get(index)) else {
+        out.content = Content::Message("Resource file not found.".to_owned());
+        return;
+    };
+    let tables = pkg.resource_tables();
+    let xml = table.render(file.source, &Resolver::new(&tables));
+    let mut s = InfoSection::new("Resource file");
+    s.row("Path", format!("res/{}/{}", file.dir, file.file))
+        .row("Generated from", format!("resources.arsc ({})", a.name));
+    if let ValuesSource::Values {
+        package,
+        res_type,
+        config,
+    } = file.source
+    {
+        let t = &table.packages[package].types[res_type];
+        let c = &t.configs[config];
+        s.row("Type", t.name.clone())
+            .row(
+                "Qualifiers",
+                if c.qualifiers.is_empty() {
+                    "(default)".to_owned()
+                } else {
+                    c.qualifiers.clone()
+                },
+            )
+            .row("Entries", group_digits(c.entries.len()));
+    }
+    out.sections.push(s);
+    out.content = Content::text(&xml, Syntax::Xml);
+}
+
 fn inspect_folder(pkg: &Package, node: NodeId, out: &mut Inspection) {
     let (mut files, mut size, mut compressed) = (0usize, 0u64, 0u64);
     for id in descendants(pkg, node) {
@@ -381,6 +494,11 @@ fn inspect_file(pkg: &Package, node: NodeId, file: FileId, out: &mut Inspection)
     let bytes = data.bytes;
     let kind = detect(entry.name(), &bytes);
     s.row("Type", kind.description(&bytes));
+    if let Some(names) = pkg.archives[entry.archive].resource_files.get(&entry.path) {
+        for name in names {
+            s.row("Resource", name.clone());
+        }
+    }
     out.sections.push(s);
     let mut hashes = InfoSection::new("Hashes");
     hashes.row("SHA-256", sha256_hex(&bytes));
@@ -400,10 +518,12 @@ fn inspect_file(pkg: &Package, node: NodeId, file: FileId, out: &mut Inspection)
             }
             Err(e) => Content::Message(format!("DEX file could not be parsed: {e}")),
         },
-        FileKind::BinaryXml => match axml::parse(&bytes) {
-            Ok(doc) => Content::text(&doc.to_xml_string(), Syntax::Xml),
-            Err(e) => Content::Message(format!("Binary XML could not be decoded: {e}")),
-        },
+        FileKind::BinaryXml => {
+            match axml::parse_with(&bytes, &Resolver::new(&pkg.resource_tables())) {
+                Ok(doc) => Content::text(&doc.to_xml_string(), Syntax::Xml),
+                Err(e) => Content::Message(format!("Binary XML could not be decoded: {e}")),
+            }
+        }
         FileKind::Image(_) => {
             if let Some((w, h)) = image_dimensions(&bytes) {
                 let mut img = InfoSection::new("Image");
@@ -423,9 +543,33 @@ fn inspect_file(pkg: &Package, node: NodeId, file: FileId, out: &mut Inspection)
             };
             Content::text(&String::from_utf8_lossy(&bytes), syntax)
         }
-        FileKind::ResourceTable | FileKind::Elf | FileKind::Zip | FileKind::Binary => {
-            Content::Hex(bytes)
+        FileKind::ResourceTable => {
+            let own = pkg.archives[entry.archive]
+                .resources
+                .as_ref()
+                .filter(|_| entry.path == "resources.arsc");
+            let parsed;
+            let table = match own {
+                Some(t) => Some(t),
+                None => {
+                    parsed = ResourceTable::parse(&bytes).ok();
+                    parsed.as_ref()
+                }
+            };
+            match table {
+                Some(t) => {
+                    out.sections.push(resources_section(t));
+                    let mut text = t.summary();
+                    if own.is_some() {
+                        text +=
+                            "\nThe decoded values are listed under \"Resources\" in the tree.\n";
+                    }
+                    Content::text(&text, Syntax::Plain)
+                }
+                None => Content::Hex(bytes),
+            }
         }
+        FileKind::Elf | FileKind::Zip | FileKind::Binary => Content::Hex(bytes),
     };
     out.sections.push(hashes);
 }

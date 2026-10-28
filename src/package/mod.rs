@@ -7,6 +7,10 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
+use std::collections::HashMap;
+
+use crate::formats::arsc::{ResourceTable, ValuesFile};
+use crate::formats::resvalue::Resolver;
 use crate::formats::zip::ZipArchive;
 use crate::formats::{axml, dex::DexFile};
 
@@ -42,6 +46,12 @@ pub struct Archive {
     /// The entry this archive was extracted from (for APKs inside an XAPK).
     pub source_file: Option<FileId>,
     pub manifest: Option<ManifestInfo>,
+    /// Decoded `resources.arsc`, if present.
+    pub resources: Option<ResourceTable>,
+    /// The `res/values*/*.xml` files generated from `resources`.
+    pub values_files: Vec<ValuesFile>,
+    /// Archive path → names of the resources stored in that file.
+    pub resource_files: HashMap<String, Vec<String>>,
     pub warnings: Vec<String>,
     zip: ZipArchive,
 }
@@ -227,6 +237,9 @@ impl Package {
         }
 
         for &apk in &apks {
+            pkg.load_resources(apk);
+        }
+        for &apk in &apks {
             pkg.load_manifest(apk);
             pkg.load_dex_files(apk);
         }
@@ -270,6 +283,9 @@ impl Package {
             sha256,
             source_file,
             manifest: None,
+            resources: None,
+            values_files: Vec::new(),
+            resource_files: HashMap::new(),
             warnings,
             zip,
         });
@@ -296,6 +312,40 @@ impl Package {
         })
     }
 
+    fn load_resources(&mut self, archive: ArchiveId) {
+        let Some(file) = self.find_file(archive, "resources.arsc") else {
+            return;
+        };
+        let result = self
+            .read_file(file)
+            .and_then(|d| ResourceTable::parse(&d.bytes).map_err(|e| e.to_string()));
+        let a = &mut self.archives[archive];
+        match result {
+            Ok(table) => {
+                a.warnings.extend(
+                    table
+                        .warnings
+                        .iter()
+                        .map(|w| format!("resources.arsc: {w}")),
+                );
+                a.values_files = table.values_files();
+                a.resource_files = table.file_references();
+                a.resources = Some(table);
+            }
+            Err(e) => a
+                .warnings
+                .push(format!("resources.arsc could not be decoded: {e}")),
+        }
+    }
+
+    /// All decoded resource tables (an APK and its splits share IDs).
+    pub fn resource_tables(&self) -> Vec<&ResourceTable> {
+        self.archives
+            .iter()
+            .filter_map(|a| a.resources.as_ref())
+            .collect()
+    }
+
     fn load_manifest(&mut self, archive: ArchiveId) {
         let Some(file) = self.find_file(archive, "AndroidManifest.xml") else {
             self.archives[archive]
@@ -303,11 +353,24 @@ impl Package {
                 .push("AndroidManifest.xml is missing".to_owned());
             return;
         };
+        let tables = self.resource_tables();
+        let resolver = Resolver::new(&tables);
         let result = self
             .read_file(file)
-            .and_then(|d| axml::parse(&d.bytes).map_err(|e| e.to_string()));
-        match result {
-            Ok(doc) => self.archives[archive].manifest = ManifestInfo::from_document(&doc),
+            .and_then(|d| axml::parse_with(&d.bytes, &resolver).map_err(|e| e.to_string()));
+        let manifest = result.map(|doc| {
+            ManifestInfo::from_document(&doc).map(|mut info| {
+                // Show the actual app name next to its resource reference.
+                if let Some(label) = &info.app_label {
+                    if let Some(text) = tables.iter().find_map(|t| t.string_by_reference(label)) {
+                        info.app_label = Some(format!("{text} ({label})"));
+                    }
+                }
+                info
+            })
+        });
+        match manifest {
+            Ok(info) => self.archives[archive].manifest = info,
             Err(e) => self.archives[archive]
                 .warnings
                 .push(format!("AndroidManifest.xml could not be decoded: {e}")),

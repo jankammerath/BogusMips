@@ -18,6 +18,11 @@ pub struct ClassRef {
 pub enum NodeKind {
     Archive(ArchiveId),
     SourceRoot(ArchiveId),
+    ResourcesRoot(ArchiveId),
+    /// A generated `values*` directory.
+    ResourceDir(ArchiveId, String),
+    /// Index into `Archive::values_files`.
+    ResourceFile(ArchiveId, usize),
     FilesRoot(ArchiveId),
     Folder(String),
     JavaPackage(String),
@@ -27,7 +32,10 @@ pub enum NodeKind {
 
 impl NodeKind {
     pub fn is_container(&self) -> bool {
-        !matches!(self, NodeKind::File(_) | NodeKind::Class(_))
+        !matches!(
+            self,
+            NodeKind::File(_) | NodeKind::Class(_) | NodeKind::ResourceFile(..)
+        )
     }
 }
 
@@ -90,8 +98,36 @@ impl Builder {
             parent,
         );
         self.source(pkg, archive, node);
+        self.resources(pkg, archive, node);
         self.files(pkg, archive, node);
         node
+    }
+
+    fn resources(&mut self, pkg: &Package, archive: ArchiveId, parent: NodeId) {
+        if pkg.archives[archive].resources.is_none() {
+            return;
+        }
+        let root = self.push(
+            "Resources".to_owned(),
+            NodeKind::ResourcesRoot(archive),
+            Some(parent),
+        );
+        let mut dirs: BTreeMap<String, Vec<(String, usize)>> = BTreeMap::new();
+        for (i, f) in pkg.archives[archive].values_files.iter().enumerate() {
+            dirs.entry(f.dir.clone())
+                .or_default()
+                .push((f.file.clone(), i));
+        }
+        // `values` (the default configuration) first, then the qualified ones.
+        let mut ordered: Vec<(String, Vec<(String, usize)>)> = dirs.into_iter().collect();
+        ordered.sort_by(|a, b| (a.0 != "values", &a.0).cmp(&(b.0 != "values", &b.0)));
+        for (dir, mut files) in ordered {
+            let node = self.push(dir.clone(), NodeKind::ResourceDir(archive, dir), Some(root));
+            files.sort();
+            for (file, index) in files {
+                self.push(file, NodeKind::ResourceFile(archive, index), Some(node));
+            }
+        }
     }
 
     fn source(&mut self, pkg: &Package, archive: ArchiveId, parent: NodeId) {
