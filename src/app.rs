@@ -381,6 +381,7 @@ fn select(ctx: &egui::Context, doc: &mut Document, node: NodeId) {
                 title: package.node_path(node),
                 content: Content::Message("Internal error while decoding this item.".to_owned()),
                 raw: None,
+                original: None,
                 sections: Vec::new(),
             });
     doc.inspection = Some(inspection);
@@ -683,6 +684,74 @@ mod tests {
         let doc = app.document.as_ref().unwrap();
         assert_eq!(doc.selected, Some(files));
         assert!(!doc.tree.expanded.contains(&files));
+    }
+
+    #[test]
+    fn beautifies_minified_assets_with_original_toggle() {
+        let js = "function a(b){return b?1:2}".repeat(20);
+        let zip = crate::formats::zip::write_stored_zip(&[
+            ("assets/app.min.js", js.as_bytes()),
+            ("assets/config.json", br#"{"a":[1,2],"b":{"c":true}}"#),
+        ]);
+        let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
+        let node = |name: &str| package.nodes.iter().position(|n| n.label == name).unwrap();
+        let (js_node, json_node) = (node("app.min.js"), node("config.json"));
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let tree = TreeState::new(&package);
+        app.document = Some(Document {
+            package,
+            tree,
+            selected: None,
+            inspection: None,
+            view_mode: ViewMode::default(),
+        });
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let frame = |app: &mut BogusMipsApp| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| app.ui(ctx));
+            output
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (node, expected) in [(json_node, "\"a\": ["), (js_node, "function a(b) {")] {
+            let doc = app.document.as_mut().unwrap();
+            select(&ctx, doc, node);
+            let inspection = doc.inspection.as_ref().unwrap();
+            assert_eq!(inspection.original.as_ref().map(Vec::len), Some(1));
+            let Content::Text { lines, .. } = &inspection.content else {
+                panic!("expected text");
+            };
+            assert!(
+                lines.len() > 3 && lines.iter().any(|l| l.contains(expected)),
+                "{lines:?}"
+            );
+
+            let texts = frame(&mut app);
+            assert!(
+                texts.iter().any(|t| t == "Formatted") && texts.iter().any(|t| t == "Original")
+            );
+            assert!(
+                texts.iter().any(|t| t.contains(expected)),
+                "formatted text not drawn"
+            );
+
+            app.document.as_mut().unwrap().view_mode = ViewMode::Original;
+            let texts = frame(&mut app);
+            assert!(
+                !texts.iter().any(|t| t.contains(expected)),
+                "original should be shown"
+            );
+        }
     }
 
     /// Renders every node of a real package headlessly. Opt-in, as no APK

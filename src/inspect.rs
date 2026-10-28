@@ -20,6 +20,22 @@ pub enum Syntax {
     Plain,
     Smali,
     Xml,
+    Json,
+    JavaScript,
+    Css,
+}
+
+impl Syntax {
+    fn of(format: Option<crate::beautify::Format>) -> Self {
+        use crate::beautify::Format;
+        match format {
+            Some(Format::Json) => Syntax::Json,
+            Some(Format::Xml | Format::Html) => Syntax::Xml,
+            Some(Format::Css) => Syntax::Css,
+            Some(Format::JavaScript) => Syntax::JavaScript,
+            None => Syntax::Plain,
+        }
+    }
 }
 
 pub enum Content {
@@ -29,10 +45,14 @@ pub enum Content {
     Message(String),
 }
 
+fn lines_of(text: &str) -> Vec<String> {
+    text.lines().map(|l| l.replace('\t', "    ")).collect()
+}
+
 impl Content {
     fn text(text: &str, syntax: Syntax) -> Self {
         Content::Text {
-            lines: text.lines().map(|l| l.replace('\t', "    ")).collect(),
+            lines: lines_of(text),
             syntax,
         }
     }
@@ -70,6 +90,8 @@ pub struct Inspection {
     pub content: Content,
     /// Raw bytes of the selected file, allowing a hex view of any file.
     pub raw: Option<Arc<[u8]>>,
+    /// The text as stored, when `content` shows a beautified version.
+    pub original: Option<Vec<String>>,
     pub sections: Vec<InfoSection>,
 }
 
@@ -110,6 +132,7 @@ pub fn inspect(pkg: &Package, node: NodeId) -> Inspection {
         title,
         content: Content::Message(String::new()),
         raw: None,
+        original: None,
         sections: Vec::new(),
     };
     match &pkg.nodes[node].kind {
@@ -536,12 +559,32 @@ fn inspect_file(pkg: &Package, node: NodeId, file: FileId, out: &mut Inspection)
             }
         }
         FileKind::Text => {
-            let syntax = if entry.path.to_ascii_lowercase().ends_with(".xml") {
-                Syntax::Xml
-            } else {
-                Syntax::Plain
-            };
-            Content::text(&String::from_utf8_lossy(&bytes), syntax)
+            let text = String::from_utf8_lossy(&bytes);
+            let processed = crate::beautify::process(&entry.path, &text);
+            let syntax = Syntax::of(processed.format);
+            if let Some(format) = processed.format {
+                let mut view = InfoSection::new("View");
+                view.row("Format", format.name());
+                view.row(
+                    "Beautified",
+                    match &processed.beautified {
+                        Some(b) => format!(
+                            "Yes — {} → {} lines",
+                            group_digits(text.lines().count()),
+                            group_digits(b.lines().count())
+                        ),
+                        None => "No (already formatted)".to_owned(),
+                    },
+                );
+                out.sections.push(view);
+            }
+            match processed.beautified {
+                Some(beautified) => {
+                    out.original = Some(lines_of(&text));
+                    Content::text(&beautified, syntax)
+                }
+                None => Content::text(&text, syntax),
+            }
         }
         FileKind::ResourceTable => {
             let own = pkg.archives[entry.archive]

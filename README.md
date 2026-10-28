@@ -15,6 +15,7 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
   - Classes are shown as smali (baksmali-compatible output).
   - Binary XML (`AndroidManifest.xml`, `res/**/*.xml`) is decoded. Resource references are resolved to names (`@string/app_name`, `@android:style/Theme`), and attribute values to their symbolic names (`protectionLevel="signature"`).
   - Images are previewed, text is shown as text, and everything else as a hex dump.
+  - Minified JSON, JavaScript (incl. React Native bundles), CSS, HTML and XML are beautified automatically, with syntax highlighting. Only whitespace is changed; **Original** shows the file as stored.
   - A hex view is available for any file.
 - **Right: collapsible file information** (⌘I): size, compression, CRC, SHA-256, DEX header details, class details, manifest summary, permissions, and any anomalies found.
 
@@ -47,6 +48,8 @@ Developer tools:
 cargo run --release --example dump_smali -- app.apk out-dir
 # Write the res/values*/*.xml generated from resources.arsc, e.g. to diff against `apktool d`
 cargo run --release --example dump_resources -- app.apk out-dir
+# Beautify a file as the content view does (format detected from the name, or given)
+cargo run --release --example beautify_file -- in.min.js out.js [json|xml|html|css|js]
 # Open packages and inspect every node, reporting timings and decode errors
 cargo run --release --example inspect_all -- app.apk other.xapk
 ```
@@ -59,6 +62,7 @@ src/
 ├── lib.rs
 ├── app.rs               # application state, menus, panels, background loading
 ├── inspect.rs           # turns a tree node into content + file information
+├── beautify/            # whitespace-only pretty-printers: JSON, XML/HTML, CSS, JavaScript
 ├── package/
 │   ├── mod.rs           # APK/XAPK loading, entry extraction, manifest summary
 │   └── tree.rs          # navigation tree (source code by package, files by folder)

@@ -28,7 +28,197 @@ pub fn highlight_into(job: &mut LayoutJob, line: &str, syntax: Syntax, font: &Fo
         Syntax::Plain => append(job, line, TEXT, font),
         Syntax::Smali => smali(job, line, font),
         Syntax::Xml => xml(job, line, font),
+        Syntax::Json => json(job, line, font),
+        Syntax::JavaScript => javascript(job, line, font),
+        Syntax::Css => css(job, line, font),
     }
+}
+
+/// Appends `line`, coloring tokens found by `classify`, which returns the
+/// end of a token starting at `i` and its color (or `None` for plain text).
+fn tokenize_line(
+    job: &mut LayoutJob,
+    line: &str,
+    font: &FontId,
+    mut classify: impl FnMut(&str, usize) -> Option<(usize, Color32)>,
+) {
+    let mut i = 0;
+    let mut plain = 0;
+    while i < line.len() {
+        match classify(line, i) {
+            Some((end, color)) if end > i => {
+                append(job, &line[plain..i], TEXT, font);
+                let end = (end..=line.len())
+                    .find(|&e| line.is_char_boundary(e))
+                    .unwrap_or(line.len());
+                append(job, &line[i..end], color, font);
+                i = end;
+                plain = end;
+            }
+            _ => i += line[i..].chars().next().map_or(1, char::len_utf8),
+        }
+    }
+    append(job, &line[plain..], TEXT, font);
+}
+
+fn starts_word(s: &str, i: usize) -> bool {
+    !s[..i]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.'))
+}
+
+fn word_end(s: &str, i: usize) -> usize {
+    s[i..]
+        .find(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$')))
+        .map_or(s.len(), |e| i + e)
+}
+
+fn number_end(s: &str, i: usize) -> usize {
+    s[i..]
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_')))
+        .map_or(s.len(), |e| i + e)
+}
+
+fn json(job: &mut LayoutJob, line: &str, font: &FontId) {
+    tokenize_line(job, line, font, |s, i| {
+        let c = s[i..].chars().next()?;
+        match c {
+            '"' => {
+                let end = quoted_end(s, i, '"');
+                let is_key = s[end..].trim_start().starts_with(':');
+                Some((end, if is_key { REGISTER } else { STRING }))
+            }
+            '-' | '0'..='9' if starts_word(s, i) => Some((
+                s[i + 1..]
+                    .find(|c: char| {
+                        !(c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '+' | '-'))
+                    })
+                    .map_or(s.len(), |e| i + 1 + e),
+                NUMBER,
+            )),
+            c if c.is_ascii_alphabetic() && starts_word(s, i) => {
+                let end = word_end(s, i);
+                matches!(&s[i..end], "true" | "false" | "null").then_some((end, KEYWORD))
+            }
+            _ => None,
+        }
+    });
+}
+
+const JS_KEYWORDS: &[&str] = &[
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "of",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "try",
+    "typeof",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
+];
+
+fn javascript(job: &mut LayoutJob, line: &str, font: &FontId) {
+    tokenize_line(job, line, font, |s, i| {
+        let rest = &s[i..];
+        let c = rest.chars().next()?;
+        if rest.starts_with("//") {
+            return Some((s.len(), COMMENT));
+        }
+        if rest.starts_with("/*") {
+            return Some((rest.find("*/").map_or(s.len(), |e| i + e + 2), COMMENT));
+        }
+        match c {
+            '"' | '\'' | '`' => Some((quoted_end(s, i, c), STRING)),
+            '0'..='9' if starts_word(s, i) => Some((number_end(s, i), NUMBER)),
+            c if (c.is_alphabetic() || matches!(c, '_' | '$')) && starts_word(s, i) => {
+                let end = word_end(s, i);
+                let word = &s[i..end];
+                if JS_KEYWORDS.contains(&word) {
+                    Some((end, KEYWORD))
+                } else if matches!(
+                    word,
+                    "true" | "false" | "null" | "undefined" | "NaN" | "Infinity"
+                ) {
+                    Some((end, NUMBER))
+                } else if s[end..].starts_with('(') {
+                    Some((end, LABEL))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    });
+}
+
+fn css(job: &mut LayoutJob, line: &str, font: &FontId) {
+    let trimmed = line.trim_end();
+    let selector = trimmed.ends_with('{') || trimmed.ends_with(',');
+    let mut in_value = false;
+    tokenize_line(job, line, font, |s, i| {
+        let rest = &s[i..];
+        let c = rest.chars().next()?;
+        if rest.starts_with("/*") {
+            return Some((rest.find("*/").map_or(s.len(), |e| i + e + 2), COMMENT));
+        }
+        match c {
+            '"' | '\'' => Some((quoted_end(s, i, c), STRING)),
+            '@' => Some((word_end(s, i + 1).max(i + 1), DIRECTIVE)),
+            '{' | '}' | ';' | ',' => {
+                in_value = false;
+                None
+            }
+            _ if selector => {
+                let end = rest
+                    .find(|c: char| matches!(c, '{' | ',' | '"' | '\'') || rest.starts_with("/*"))
+                    .map_or(s.len(), |e| i + e);
+                Some((end, TYPE))
+            }
+            ':' if !in_value => {
+                in_value = true;
+                None
+            }
+            '#' | '0'..='9' | '.' if in_value => Some((number_end(s, i + 1), NUMBER)),
+            c if !in_value && (c.is_alphanumeric() || c == '-') => {
+                let end = rest
+                    .find(|c: char| !(c.is_alphanumeric() || c == '-'))
+                    .map_or(s.len(), |e| i + e);
+                Some((end, REGISTER))
+            }
+            _ => None,
+        }
+    });
 }
 
 fn is_word(c: char) -> bool {
@@ -224,11 +414,41 @@ mod tests {
     }
 
     #[test]
+    fn new_syntaxes() {
+        let s = sections(
+            "  \"name\": \"value\", \"n\": -1.5, \"ok\": true",
+            Syntax::Json,
+        );
+        assert!(s.contains(&("\"name\"".into(), REGISTER)));
+        assert!(s.contains(&("\"value\"".into(), STRING)));
+        assert!(s.contains(&("-1.5".into(), NUMBER)));
+        assert!(s.contains(&("true".into(), KEYWORD)));
+
+        let s = sections("  return foo(\"x\", 42) // done", Syntax::JavaScript);
+        assert!(s.contains(&("return".into(), KEYWORD)));
+        assert!(s.contains(&("foo".into(), LABEL)));
+        assert!(s.contains(&("42".into(), NUMBER)));
+        assert!(s.contains(&("// done".into(), COMMENT)));
+
+        let s = sections("  color: #ff0000;", Syntax::Css);
+        assert!(s.contains(&("color".into(), REGISTER)));
+        assert!(s.contains(&("#ff0000".into(), NUMBER)));
+        let s = sections(".btn:hover {", Syntax::Css);
+        assert!(s.contains(&(".btn:hover ".into(), TYPE)));
+    }
+
+    #[test]
     fn handles_unicode_and_garbage() {
         for line in [
             "  ä\"ö", "<", "\"", "    :", "  L", "  [", "#ü", "  v", "<!-- x",
         ] {
-            for syntax in [Syntax::Smali, Syntax::Xml] {
+            for syntax in [
+                Syntax::Smali,
+                Syntax::Xml,
+                Syntax::Json,
+                Syntax::JavaScript,
+                Syntax::Css,
+            ] {
                 let s = sections(line, syntax);
                 let text: String = s.iter().map(|(t, _)| t.as_str()).collect();
                 assert_eq!(text, line);

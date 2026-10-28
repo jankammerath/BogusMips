@@ -9,24 +9,41 @@ use crate::inspect::{Content, Inspection, Syntax};
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum ViewMode {
+    /// Rendered / decoded / beautified content.
     #[default]
     Preview,
+    /// The text as stored, for beautified files.
+    Original,
     Hex,
 }
 
 pub fn show(ui: &mut egui::Ui, inspection: &Inspection, mode: &mut ViewMode) {
+    if inspection.original.is_none() && *mode == ViewMode::Original {
+        *mode = ViewMode::Preview;
+    }
+    let shown_text = match (&inspection.content, &inspection.original, *mode) {
+        (Content::Text { .. }, Some(original), ViewMode::Original) => Some(original),
+        (Content::Text { lines, .. }, _, ViewMode::Preview) => Some(lines),
+        _ => None,
+    };
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if inspection.raw.is_some() && !matches!(inspection.content, Content::Hex(_)) {
                 ui.selectable_value(mode, ViewMode::Hex, "Hex");
-                ui.selectable_value(mode, ViewMode::Preview, "Preview");
+                if inspection.original.is_some() {
+                    ui.selectable_value(mode, ViewMode::Original, "Original")
+                        .on_hover_text("The text as stored in the package");
+                    ui.selectable_value(mode, ViewMode::Preview, "Formatted")
+                        .on_hover_text("Beautified; only whitespace differs from the original");
+                } else {
+                    ui.selectable_value(mode, ViewMode::Preview, "Preview");
+                }
             }
-            if let Content::Text { lines, .. } = &inspection.content {
-                if *mode == ViewMode::Preview
-                    && ui
-                        .button("Copy")
-                        .on_hover_text("Copy the full text")
-                        .clicked()
+            if let Some(lines) = shown_text {
+                if ui
+                    .button("Copy")
+                    .on_hover_text("Copy the full text")
+                    .clicked()
                 {
                     ui.ctx().copy_text(lines.join("\n"));
                 }
@@ -41,6 +58,10 @@ pub fn show(ui: &mut egui::Ui, inspection: &Inspection, mode: &mut ViewMode) {
     let id = egui::Id::new(("content", inspection.node));
     match (&inspection.content, &inspection.raw, *mode) {
         (_, Some(raw), ViewMode::Hex) | (Content::Hex(raw), _, _) => hex_view(ui, id, raw),
+        (Content::Text { syntax, .. }, _, ViewMode::Original) if inspection.original.is_some() => {
+            let original = inspection.original.as_deref().unwrap_or_default();
+            text_view(ui, id.with("original"), original, *syntax)
+        }
         (Content::Text { lines, syntax }, _, _) => text_view(ui, id, lines, *syntax),
         (Content::Image { uri, bytes }, _, _) => {
             ScrollArea::both()
@@ -185,6 +206,7 @@ mod tests {
                 syntax: Syntax::Plain,
             },
             raw: None,
+            original: None,
             sections: Vec::new(),
         };
         let mut mode = ViewMode::Preview;
