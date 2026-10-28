@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 use eframe::egui::{self, Color32, Key, ScrollArea, Sense, Shape, Stroke, pos2, vec2};
 
+use crate::export::{self, ExportKind};
 use crate::package::{NodeId, NodeKind, Package};
 
 /// Row metrics and colors modelled on the VS Code explorer.
@@ -228,14 +229,23 @@ fn paint_row(
     response
 }
 
-/// Shows the tree. Returns the newly selected node, if the selection changed.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct TreeResponse {
+    /// The newly selected node, if the selection changed.
+    pub selected: Option<NodeId>,
+    /// Export chosen from a row's context menu.
+    pub export: Option<(NodeId, ExportKind)>,
+}
+
+/// Shows the tree.
 pub fn show(
     ui: &mut egui::Ui,
     pkg: &Package,
     state: &mut TreeState,
     selected: Option<NodeId>,
-) -> Option<NodeId> {
+) -> TreeResponse {
     let mut new_selection = None;
+    let mut export_request = None;
 
     ui.label(
         egui::RichText::new("PACKAGE")
@@ -344,6 +354,21 @@ pub fn show(
                             state.expanded.insert(id);
                         }
                     }
+                    if row.secondary_clicked() {
+                        new_selection = Some(id);
+                    }
+                    row.context_menu(|ui| {
+                        let options = export::options(pkg, id);
+                        if options.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("Nothing to export"));
+                        }
+                        for option in options {
+                            if ui.button(option.label).clicked() {
+                                export_request = Some((id, option.kind));
+                                ui.close();
+                            }
+                        }
+                    });
                 }
             })
         })
@@ -351,7 +376,10 @@ pub fn show(
     state.scroll_offset = output.state.offset.y;
     state.view_height = output.inner_rect.height();
 
-    new_selection.filter(|&n| Some(n) != selected)
+    TreeResponse {
+        selected: new_selection.filter(|&n| Some(n) != selected),
+        export: export_request,
+    }
 }
 
 #[cfg(test)]

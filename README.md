@@ -11,6 +11,7 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
   - **Files**: every entry in the archive.
   - XAPK bundles show each contained APK (base and split APKs) separately.
   - Filter box (⌘F) and keyboard navigation with the arrow keys.
+  - Right-click an item (or **File → Export…**, ⌘E) to export it: files as stored in the package, or **as shown** (decoded binary XML, beautified text); classes as `.smali`; generated resource files as XML; APKs contained in an XAPK as `.apk`.
 - **Center: content of the selected item**
   - Classes are shown as smali (baksmali-compatible output).
   - Binary XML (`AndroidManifest.xml`, `res/**/*.xml`) is decoded. Resource references are resolved to names (`@string/app_name`, `@android:style/Theme`), and attribute values to their symbolic names (`protectionLevel="signature"`).

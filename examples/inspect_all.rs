@@ -5,6 +5,7 @@
 
 use std::time::Instant;
 
+use bogusmips::export;
 use bogusmips::inspect::{Content, inspect};
 use bogusmips::package::Package;
 
@@ -22,7 +23,14 @@ fn main() {
         let opened = start.elapsed();
         let start = Instant::now();
         let mut messages = 0;
+        let mut exports = 0;
         for node in 0..pkg.nodes.len() {
+            for option in export::options(&pkg, node) {
+                match export::export_bytes(&pkg, node, option.kind) {
+                    Ok(_) => exports += 1,
+                    Err(e) => println!("  export {} ({:?}): {e}", pkg.node_path(node), option.kind),
+                }
+            }
             let inspection = inspect(&pkg, node);
             if let Content::Message(m) = &inspection.content {
                 if m.contains("could not") {
@@ -39,7 +47,7 @@ fn main() {
             }
         }
         println!(
-            "{}: {} nodes, {} files, {} dex, opened in {:?}, inspected all in {:?}, {messages} decode errors",
+            "{}: {} nodes, {} files, {} dex, opened in {:?}, inspected + exported all ({exports} exports) in {:?}, {messages} decode errors",
             path.display(),
             pkg.nodes.len(),
             pkg.files.len(),

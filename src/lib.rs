@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod beautify;
+pub mod export;
 pub mod formats;
 pub mod inspect;
 pub mod package;

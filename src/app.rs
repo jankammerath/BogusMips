@@ -3,7 +3,8 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
-use crate::inspect::{Content, Inspection, group_digits, inspect};
+use crate::export::{self, ExportKind};
+use crate::inspect::{Content, Inspection, format_size, group_digits, inspect};
 use crate::package::{NodeId, Package, PackageKind};
 use crate::ui::content_view::{self, ViewMode};
 use crate::ui::tree_view::{self, TreeState};
@@ -13,6 +14,17 @@ const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O)
 const CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
 const TOGGLE_INFO: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::I);
 const FIND: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::F);
+const EXPORT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::E);
+
+/// Asks where to save an export, given the suggested file name.
+type SaveDialog = Box<dyn Fn(&str) -> Option<PathBuf>>;
+
+fn native_save_dialog(file_name: &str) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Export")
+        .set_file_name(file_name)
+        .save_file()
+}
 
 struct Loading {
     path: PathBuf,
@@ -31,7 +43,12 @@ pub struct BogusMipsApp {
     document: Option<Document>,
     loading: Option<Loading>,
     pending_open: Option<PathBuf>,
-    error: Option<String>,
+    pending_export: Option<(NodeId, ExportKind)>,
+    /// Title and message of an error dialog.
+    error: Option<(&'static str, String)>,
+    /// Confirmation shown in the status bar (e.g. after an export).
+    notice: Option<String>,
+    save_dialog: SaveDialog,
     show_info: bool,
     native_theme_applied: bool,
     window_title: String,
@@ -50,7 +67,10 @@ impl BogusMipsApp {
             document: None,
             loading: None,
             pending_open: initial_file,
+            pending_export: None,
             error: None,
+            notice: None,
+            save_dialog: Box::new(native_save_dialog),
             show_info: true,
             native_theme_applied: false,
             window_title: "BogusMips".to_owned(),
@@ -99,14 +119,14 @@ impl BogusMipsApp {
                 self.loading = None;
             }
             Ok(Err(e)) => {
-                self.error = Some(e);
+                self.error = Some(("Could not open file", e));
                 self.loading = None;
             }
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
-                self.error = Some(format!(
-                    "Loading {} failed unexpectedly.",
-                    loading.path.display()
+                self.error = Some((
+                    "Could not open file",
+                    format!("Loading {} failed unexpectedly.", loading.path.display()),
                 ));
                 self.loading = None;
             }
@@ -117,6 +137,49 @@ impl BogusMipsApp {
         if self.document.take().is_some() {
             ctx.forget_all_images();
             self.set_title(ctx, "BogusMips".to_owned());
+        }
+    }
+
+    /// The selected node and its primary export, if it can be exported.
+    fn primary_export(&self) -> Option<(NodeId, ExportKind)> {
+        let doc = self.document.as_ref()?;
+        let node = doc.selected?;
+        export::options(&doc.package, node)
+            .first()
+            .map(|o| (node, o.kind))
+    }
+
+    fn request_primary_export(&mut self) {
+        if let Some(request) = self.primary_export() {
+            self.pending_export = Some(request);
+        }
+    }
+
+    fn run_export(&mut self, node: NodeId, kind: ExportKind) {
+        let Some(doc) = &self.document else {
+            return;
+        };
+        let options = export::options(&doc.package, node);
+        let Some(option) = options.iter().find(|o| o.kind == kind) else {
+            return;
+        };
+        let Some(path) = (self.save_dialog)(&option.file_name) else {
+            return;
+        };
+        let written = export::export_bytes(&doc.package, node, kind).and_then(|bytes| {
+            std::fs::write(&path, &bytes)
+                .map(|()| bytes.len())
+                .map_err(|e| format!("{}: {e}", path.display()))
+        });
+        match written {
+            Ok(len) => {
+                self.notice = Some(format!(
+                    "Exported {} to {}",
+                    format_size(len as u64),
+                    path.display()
+                ));
+            }
+            Err(e) => self.error = Some(("Could not export", e)),
         }
     }
 
@@ -158,12 +221,13 @@ impl BogusMipsApp {
     }
 
     fn handle_input(&mut self, ctx: &egui::Context) {
-        let (open, close, toggle_info, find, dropped) = ctx.input_mut(|i| {
+        let (open, close, toggle_info, find, export, dropped) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&OPEN),
                 i.consume_shortcut(&CLOSE),
                 i.consume_shortcut(&TOGGLE_INFO),
                 i.consume_shortcut(&FIND),
+                i.consume_shortcut(&EXPORT),
                 i.raw.dropped_files.iter().find_map(|f| f.path.clone()),
             )
         });
@@ -179,6 +243,9 @@ impl BogusMipsApp {
         if find {
             ctx.memory_mut(|m| m.request_focus(egui::Id::new(tree_view::FILTER_ID)));
         }
+        if export {
+            self.request_primary_export();
+        }
         if let Some(path) = dropped {
             self.pending_open = Some(path);
         }
@@ -193,6 +260,17 @@ impl BogusMipsApp {
                         .clicked()
                     {
                         self.pick_file();
+                    }
+                    let can_export = self.primary_export().is_some();
+                    if ui
+                        .add_enabled(
+                            can_export,
+                            egui::Button::new("Export…").shortcut_text(ctx.format_shortcut(&EXPORT)),
+                        )
+                        .on_hover_text("Export the selected item (also available by right-clicking it in the tree)")
+                        .clicked()
+                    {
+                        self.request_primary_export();
                     }
                     if ui
                         .add_enabled(
@@ -263,6 +341,17 @@ impl BogusMipsApp {
                     }
                 } else {
                     ui.label("No file open");
+                }
+                if let Some(notice) = &self.notice {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(format!("✔ {notice}"))
+                                    .color(ui.visuals().weak_text_color()),
+                            )
+                            .truncate(),
+                        );
+                    });
                 }
             });
         });
@@ -425,10 +514,12 @@ impl BogusMipsApp {
                 .default_width(320.0)
                 .min_width(200.0)
                 .show(ctx, |ui| {
-                    if let Some(node) =
-                        tree_view::show(ui, &doc.package, &mut doc.tree, doc.selected)
-                    {
+                    let response = tree_view::show(ui, &doc.package, &mut doc.tree, doc.selected);
+                    if let Some(node) = response.selected {
                         select(ctx, doc, node);
+                    }
+                    if response.export.is_some() {
+                        self.pending_export = response.export;
                     }
                 });
         }
@@ -462,10 +553,14 @@ impl BogusMipsApp {
             );
         }
 
-        if let Some(error) = self.error.clone() {
+        if let Some((node, kind)) = self.pending_export.take() {
+            self.run_export(node, kind);
+        }
+
+        if let Some((title, error)) = self.error.clone() {
             let modal = egui::Modal::new(egui::Id::new("error_modal")).show(ctx, |ui| {
                 ui.set_max_width(420.0);
-                ui.heading("Could not open file");
+                ui.heading(title);
                 ui.add_space(8.0);
                 ui.label(error);
                 ui.add_space(12.0);
@@ -752,6 +847,107 @@ mod tests {
                 "original should be shown"
             );
         }
+    }
+
+    #[test]
+    fn right_click_exports_the_file() {
+        let zip = crate::formats::zip::write_stored_zip(&[
+            ("assets/config.json", br#"{"a":1}"#),
+            ("assets/z.txt", b"other"),
+        ]);
+        let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
+        let target = node_named(&package, "config.json");
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let out_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("target/test-export");
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let (dir, log) = (out_dir.clone(), asked.clone());
+        app.save_dialog = Box::new(move |name| {
+            log.borrow_mut().push(name.to_owned());
+            Some(dir.join(name))
+        });
+        let mut tree = TreeState::new(&package);
+        tree.reveal(&package, target);
+        app.document = Some(Document {
+            package,
+            tree,
+            selected: None,
+            inspection: None,
+            view_mode: ViewMode::default(),
+        });
+
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+        let run = |app: &mut BogusMipsApp, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            };
+            let output = ctx.run(input, |ctx| app.ui(ctx));
+            output
+                .shapes
+                .iter()
+                .filter_map(|c| match &c.shape {
+                    egui::Shape::Text(t) => Some((t.pos, t.galley.text().to_owned())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let click = |pos: egui::Pos2, button| {
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed: false,
+                    modifiers: Default::default(),
+                },
+            ]
+        };
+        let find = |texts: &[(egui::Pos2, String)], label: &str| {
+            texts
+                .iter()
+                .find(|(_, t)| t == label)
+                .map(|(p, _)| *p + egui::vec2(4.0, 4.0))
+        };
+
+        let texts = run(&mut app, vec![]);
+        let row = find(&texts, "config.json").expect("row drawn");
+        run(&mut app, click(row, egui::PointerButton::Secondary));
+        let texts = run(&mut app, vec![]);
+        assert_eq!(app.document.as_ref().unwrap().selected, Some(target));
+        assert!(find(&texts, "Export…").is_some(), "context menu not shown");
+        let item = find(&texts, "Export as shown…").expect("as-shown option");
+        run(&mut app, click(item, egui::PointerButton::Primary));
+        run(&mut app, vec![]);
+
+        assert_eq!(asked.borrow().as_slice(), ["config.json"]);
+        let written = std::fs::read_to_string(out_dir.join("config.json")).unwrap();
+        assert_eq!(written, "{\n  \"a\": 1\n}\n");
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|n| n.contains("config.json"))
+        );
+        assert!(app.error.is_none());
+
+        // File → Export… / ⌘E exports the selection's primary (raw) form.
+        app.request_primary_export();
+        run(&mut app, vec![]);
+        let raw = std::fs::read_to_string(out_dir.join("config.json")).unwrap();
+        assert_eq!(raw, r#"{"a":1}"#);
+        std::fs::remove_dir_all(&out_dir).unwrap();
+    }
+
+    fn node_named(package: &Package, label: &str) -> NodeId {
+        package.nodes.iter().position(|n| n.label == label).unwrap()
     }
 
     /// Renders every node of a real package headlessly. Opt-in, as no APK
