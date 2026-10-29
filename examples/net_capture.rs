@@ -12,7 +12,7 @@ use bogusmips::package::{Package, PackageKind};
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let bypass_gms = args.iter().any(|a| a == "--bypass" || a == "bypass");
+    let bypass_checks = args.iter().any(|a| a == "--bypass" || a == "bypass");
     args.retain(|a| a != "--bypass" && a != "bypass");
     let mut args = args.into_iter();
     let (Some(input), Some(avd)) = (args.next(), args.next()) else {
@@ -56,7 +56,7 @@ fn main() {
         avd,
         apks,
         package: package_name,
-        bypass_gms,
+        bypass_checks,
     });
 
     let deadline = Instant::now() + Duration::from_secs(seconds);

@@ -43,7 +43,7 @@ impl Phase {
             Phase::EnablingRoot => "Enabling root",
             Phase::InstallingCa => "Installing the proxy certificate",
             Phase::InstallingApp => "Installing the app",
-            Phase::InstallingBypass => "Bypassing the Play Services check",
+            Phase::InstallingBypass => "Bypassing Play Services and root checks",
             Phase::Launching => "Launching the app",
             Phase::Capturing => "Capturing",
             Phase::Stopped => "Stopped",
@@ -84,7 +84,7 @@ pub struct StartConfig {
     /// Package to launch after install.
     pub package: Option<String>,
     /// Inject the frida-gadget Play Services availability bypass before launch.
-    pub bypass_gms: bool,
+    pub bypass_checks: bool,
 }
 
 pub struct NetworkController {
@@ -269,7 +269,7 @@ fn run_session(
         );
     }
     if let Some(package) = &config.package {
-        if config.bypass_gms {
+        if config.bypass_checks {
             let install_bypass = || -> Result<String, String> {
                 let abi = emulator.device_abi()?;
                 let frida_abi = bypass::frida_abi(&abi)
@@ -277,13 +277,13 @@ fn run_session(
                 status
                     .lock()
                     .unwrap()
-                    .log("Downloading the Play Services bypass (frida gadget)…".to_owned());
+                    .log("Downloading the bypass (frida gadget)…".to_owned());
                 let gadget = bypass::ensure_gadget(&bypass::cache_dir(), frida_abi)?;
-                emulator.install_gms_bypass(&gadget, package)
+                emulator.install_bypass(&gadget, package)
             };
             step!(
                 Phase::InstallingBypass,
-                "Bypassing the Play Services check",
+                "Bypassing Play Services and root checks",
                 install_bypass()
             );
         }
@@ -331,7 +331,7 @@ mod tests {
             avd: "x".into(),
             apks: vec![],
             package: None,
-            bypass_gms: false,
+            bypass_checks: false,
         });
         let (phase, error, _) = controller.status_snapshot();
         assert_eq!(phase, Phase::Failed);

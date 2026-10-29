@@ -1,46 +1,136 @@
-//! Optional Google Play Services availability bypass.
+//! Optional Play Services availability and root-detection bypass.
 //!
 //! Rootable `google_apis` emulators carry an older Google Play Services build
-//! than many apps are compiled against, so a `GoogleApiAvailability`
-//! availability check returns `SERVICE_VERSION_UPDATE_REQUIRED` and the app
-//! aborts before any traffic is produced. To keep such apps running during a
-//! capture we inject [frida-gadget](https://frida.re/docs/gadget/) with a tiny
-//! script that forces those checks to report `SUCCESS` (0). The gadget is
-//! loaded into the target app via the `wrap.<package>` property (`LD_PRELOAD`),
-//! so no frida tooling is needed on the host or a frida-server on the device.
+//! than many apps are compiled against (so `GoogleApiAvailability` returns
+//! `SERVICE_VERSION_UPDATE_REQUIRED`), and their `userdebug` build looks rooted
+//! to apps (`ro.debuggable=1`, `test-keys`, RootBeer, …). Either makes an app
+//! abort before producing any traffic. To keep such apps running during a
+//! capture we inject [frida-gadget](https://frida.re/docs/gadget/) with a small
+//! script that forces the Play Services availability checks to report
+//! `SUCCESS` (0) and neutralises the common root checks. The gadget is loaded
+//! into the target app via the `wrap.<package>` property (`LD_PRELOAD`), so no
+//! frida tooling is needed on the host or a frida-server on the device.
 //!
-//! This only makes the *presence* check pass — it does not provide the
-//! services themselves, which is all that is needed to keep root/environment
-//! checks from blocking network analysis.
+//! This only makes the checks pass — it does not provide the services or
+//! un-root the device — which is all that is needed to keep these environment
+//! checks from blocking network analysis. It cannot defeat server-side
+//! attestation such as the Play Integrity API.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// frida release whose gadget is downloaded. Kept current but pinned so the
-/// download URL is deterministic.
-pub const FRIDA_VERSION: &str = "17.24.3";
+/// frida release whose gadget is downloaded. Pinned to the last 16.x, because
+/// 17.x removed the built-in `Java`/`ObjC` script globals this bypass relies
+/// on (they became ES-module imports needing a bundler). Override with the
+/// `BOGUSMIPS_FRIDA_VERSION` environment variable, e.g. to match a device's
+/// Android version.
+pub const FRIDA_VERSION: &str = "16.7.19";
+
+/// The frida version to download — [`FRIDA_VERSION`] unless overridden by the
+/// `BOGUSMIPS_FRIDA_VERSION` environment variable.
+pub fn frida_version() -> String {
+    std::env::var("BOGUSMIPS_FRIDA_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| FRIDA_VERSION.to_owned())
+}
 
 /// The frida script the gadget runs before the app's entry point. It forces
 /// the common Play Services availability checks to return
-/// `ConnectionResult.SUCCESS` (0).
+/// `ConnectionResult.SUCCESS` (0) and makes the common root-detection checks
+/// report an unrooted device.
 pub fn bypass_script() -> &'static str {
     r#"Java.perform(function () {
-  function force0(className, method) {
+  function hookReturn(className, method, value) {
     try {
       var cls = Java.use(className);
+      if (!cls[method]) return;
       cls[method].overloads.forEach(function (ov) {
-        ov.implementation = function () {
-          return 0; // ConnectionResult.SUCCESS
-        };
+        ov.implementation = function () { return value; };
       });
     } catch (e) {
       // Class or method not present in this app; ignore.
     }
   }
-  force0('com.google.android.gms.common.GoogleApiAvailability', 'isGooglePlayServicesAvailable');
-  force0('com.google.android.gms.common.GoogleApiAvailabilityLight', 'isGooglePlayServicesAvailable');
-  force0('com.google.android.gms.common.GooglePlayServicesUtil', 'isGooglePlayServicesAvailable');
-  force0('com.google.android.gms.common.GooglePlayServicesUtilLight', 'isGooglePlayServicesAvailable');
+
+  // --- Google Play Services availability -> ConnectionResult.SUCCESS (0) ---
+  ['com.google.android.gms.common.GoogleApiAvailability',
+   'com.google.android.gms.common.GoogleApiAvailabilityLight',
+   'com.google.android.gms.common.GooglePlayServicesUtil',
+   'com.google.android.gms.common.GooglePlayServicesUtilLight'].forEach(function (c) {
+    hookReturn(c, 'isGooglePlayServicesAvailable', 0);
+  });
+
+  // --- RootBeer: every detection method reports "not rooted" ---
+  ['isRooted', 'isRootedWithBusyBoxCheck', 'isRootedWithoutBusyBoxCheck',
+   'detectRootManagementApps', 'detectPotentiallyDangerousApps', 'detectRootCloakingApps',
+   'detectTestKeys', 'checkForBusyBoxBinary', 'checkForSuBinary', 'checkSuExists',
+   'checkForRWPaths', 'checkForDangerousProps', 'checkForRootNative',
+   'checkForMagiskBinary', 'checkForBinary'].forEach(function (m) {
+    hookReturn('com.scottyab.rootbeer.RootBeer', m, false);
+  });
+
+  // --- Build fingerprint: hide the userdebug test-keys tag ---
+  try {
+    var Build = Java.use('android.os.Build');
+    Build.TAGS.value = 'release-keys';
+  } catch (e) {}
+
+  // --- Dangerous system properties report safe values ---
+  try {
+    var SystemProperties = Java.use('android.os.SystemProperties');
+    var safe = { 'ro.debuggable': '0', 'ro.secure': '1', 'service.adb.root': '0',
+                 'ro.build.tags': 'release-keys', 'ro.build.type': 'user',
+                 'ro.build.selinux': '1' };
+    SystemProperties.get.overload('java.lang.String').implementation = function (key) {
+      var k = '' + key;
+      if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
+      return this.get(key);
+    };
+    SystemProperties.get.overload('java.lang.String', 'java.lang.String').implementation = function (key, def) {
+      var k = '' + key;
+      if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
+      return this.get(key, def);
+    };
+  } catch (e) {}
+
+  // --- Hide root artifacts from File.exists() ---
+  try {
+    var File = Java.use('java.io.File');
+    var markers = ['su', 'magisk', 'superuser', 'supersu', 'busybox', 'xposed',
+                   'frida', '/sbin/.magisk', '/cache/.disable_magisk', 'Superuser.apk'];
+    File.exists.implementation = function () {
+      try {
+        var path = ('' + this.getAbsolutePath()).toLowerCase();
+        for (var i = 0; i < markers.length; i++) {
+          if (path.indexOf(markers[i]) !== -1) return false;
+        }
+      } catch (e) {}
+      return this.exists();
+    };
+  } catch (e) {}
+
+  // --- Make `su` / `which su` / magisk shell-outs fail ---
+  function isRootCmd(s) {
+    if (s === null || s === undefined) return false;
+    s = '' + s;
+    return s === 'su' || /(^|\/)su(\s|$)/.test(s) || s.indexOf('which su') !== -1 ||
+           s.indexOf('busybox') !== -1 || s.indexOf('magisk') !== -1 || s.indexOf('Superuser') !== -1;
+  }
+  try {
+    var Runtime = Java.use('java.lang.Runtime');
+    var IOException = Java.use('java.io.IOException');
+    Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
+      if (isRootCmd(cmd)) throw IOException.$new('No such file or directory');
+      return this.exec(cmd);
+    };
+    Runtime.exec.overload('[Ljava.lang.String;').implementation = function (cmds) {
+      var joined = '';
+      try { joined = cmds ? cmds.join(' ') : ''; } catch (e) {}
+      if (isRootCmd(joined)) throw IOException.$new('No such file or directory');
+      return this.exec(cmds);
+    };
+  } catch (e) {}
 });
 "#
 }
@@ -84,14 +174,15 @@ pub fn cache_dir() -> PathBuf {
 /// Ensures the decompressed frida gadget for `abi` exists in `cache_dir`,
 /// downloading and decompressing it on first use. Returns its path.
 pub fn ensure_gadget(cache_dir: &Path, abi: &str) -> Result<PathBuf, String> {
-    let dest = cache_dir.join(format!("frida-gadget-{FRIDA_VERSION}-android-{abi}.so"));
+    let version = frida_version();
+    let dest = cache_dir.join(format!("frida-gadget-{version}-android-{abi}.so"));
     if dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(dest);
     }
     std::fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
 
-    let url = gadget_url(FRIDA_VERSION, abi);
-    let compressed = cache_dir.join(format!("frida-gadget-{FRIDA_VERSION}-android-{abi}.so.xz"));
+    let url = gadget_url(&version, abi);
+    let compressed = cache_dir.join(format!("frida-gadget-{version}-android-{abi}.so.xz"));
     download(&url, &compressed)?;
 
     let bytes = std::fs::read(&compressed).map_err(|e| e.to_string())?;
@@ -135,12 +226,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn script_forces_success() {
+    fn script_forces_success_and_hides_root() {
         let s = bypass_script();
         assert!(s.contains("com.google.android.gms.common.GoogleApiAvailability"));
         assert!(s.contains("isGooglePlayServicesAvailable"));
-        assert!(s.contains("return 0"));
         assert!(s.contains("Java.perform"));
+        // Root-detection bypass.
+        assert!(s.contains("com.scottyab.rootbeer.RootBeer"));
+        assert!(s.contains("release-keys"));
+        assert!(s.contains("ro.debuggable"));
     }
 
     #[test]

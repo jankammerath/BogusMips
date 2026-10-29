@@ -787,7 +787,7 @@ impl BogusMipsApp {
         if avd.is_empty() {
             return;
         }
-        match build_start_config(&doc.package, avd, doc.net_view.bypass_gms) {
+        match build_start_config(&doc.package, avd, doc.net_view.bypass_checks) {
             Ok((config, tempdir)) => {
                 if let Some(dir) = doc.net_tempdir.replace(tempdir) {
                     let _ = std::fs::remove_dir_all(dir);
@@ -906,7 +906,7 @@ impl BogusMipsApp {
 fn build_start_config(
     package: &Package,
     avd: String,
-    bypass_gms: bool,
+    bypass_checks: bool,
 ) -> Result<(StartConfig, PathBuf), String> {
     use crate::package::PackageKind;
     let tempdir = std::env::temp_dir().join(format!(
@@ -944,7 +944,7 @@ fn build_start_config(
             avd,
             apks,
             package: package_name,
-            bypass_gms,
+            bypass_checks,
         },
         tempdir,
     ))

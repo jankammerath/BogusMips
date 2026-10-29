@@ -17,7 +17,7 @@ pub struct NetworkViewState {
     pub avd: String,
     pub filter: String,
     pub log_expanded: bool,
-    pub bypass_gms: bool,
+    pub bypass_checks: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,12 +109,14 @@ pub fn show(
             ui.add_space(6.0);
 
             ui.add_enabled_ui(!running, |ui| {
-                ui.checkbox(&mut state.bypass_gms, "Bypass Play Services check")
+                ui.checkbox(&mut state.bypass_checks, "Bypass Play Services & root checks")
                     .on_hover_text(
                         "Inject a frida gadget that makes Google Play Services \
-                         availability checks report success, so apps that abort \
-                         without Play Services keep running. Downloads the gadget \
-                         once (needs network and a rootable emulator).",
+                         availability checks report success and neutralises common \
+                         root-detection checks (RootBeer, test-keys, su), so apps \
+                         that abort on a rooted/Play-Services-less emulator keep \
+                         running. Downloads the gadget once (needs network and a \
+                         rootable emulator). Cannot defeat server-side Play Integrity.",
                     );
             });
             ui.add_space(6.0);

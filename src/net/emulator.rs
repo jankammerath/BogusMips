@@ -378,13 +378,13 @@ impl Emulator {
             .map(|s| s.trim().to_owned())
     }
 
-    /// Arms the Play Services availability bypass for `package`: pushes the
-    /// frida gadget, its config and the bypass script, and sets the
-    /// `wrap.<package>` property so the gadget is `LD_PRELOAD`ed when the app
-    /// next starts (which must be *after* this call).
-    pub fn install_gms_bypass(&self, gadget_local: &Path, package: &str) -> Step {
+    /// Arms the Play Services availability and root-detection bypass for
+    /// `package`: pushes the frida gadget, its config and the bypass script,
+    /// and sets the `wrap.<package>` property so the gadget is `LD_PRELOAD`ed
+    /// when the app next starts (which must be *after* this call).
+    pub fn install_bypass(&self, gadget_local: &Path, package: &str) -> Step {
         const GADGET: &str = "/data/local/tmp/bogusmips-gadget.so";
-        const SCRIPT: &str = "/data/local/tmp/bogusmips-gms-bypass.js";
+        const SCRIPT: &str = "/data/local/tmp/bogusmips-bypass.js";
         // frida accepts either form; push both so it is found regardless.
         const CONFIG: &str = "/data/local/tmp/bogusmips-gadget.config";
         const CONFIG_SO: &str = "/data/local/tmp/bogusmips-gadget.config.so";
@@ -414,7 +414,7 @@ impl Emulator {
         let value = format!("LD_PRELOAD={GADGET}");
         self.adb(&["shell", "setprop", &prop, &value])
             .map_err(|e| format!("could not arm the bypass (setprop {prop}): {e}"))?;
-        Ok("Play Services bypass armed".into())
+        Ok("bypass armed".into())
     }
 }
 
