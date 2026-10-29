@@ -4,7 +4,7 @@
 
 BogusMips is written in Rust and allows performing analyses on how far your Android app can be disassembled. It allows you to open the `*.apk` or `*.xapk` file of your app to see how far your app can be disassembled. 
 
-![Kotlin class](/screenshots/screenshot1.png)
+![Source Code and Resources extracted with BogusMips Disassembler](/screenshots/screenshot1.png)
 
 ## Features
 
@@ -29,6 +29,8 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
 ### Network
 
 The **Network** view (⇧⌘N) is a stripped-down, Postman-like traffic sniffer. It starts an Android emulator (AVD), routes the guest's traffic through a built-in man-in-the-middle proxy, installs the open APK/XAPK, launches it, and captures its HTTP **and HTTPS** requests live. Captured requests appear in a list on the left; selecting one shows its full request/response (headers and body, pretty / raw / hex) in the editor, with timing and connection details in the information panel.
+
+![App network traffic analysis](/screenshots/screenshot2.png)
 
 Full HTTPS decryption requires a **rootable** emulator image (`google_apis` / `aosp_atd`, *not* `google_apis_playstore`), because the proxy's CA must be installed as a system trust anchor. On start, BogusMips enables `adb root` and installs its generated CA (a short-lived, per-session CA, as PEM) into the system and Conscrypt (APEX) trust stores. On Android 14+ (API 34+) those stores live in per-process mount namespaces, so the CA is placed in an overlay directory — relabelled with the `system_security_cacerts_file` SELinux context (both the files **and** the directory, or apps are denied access) — and bind-mounted over the stores in every process's mount namespace via `nsenter`. The target app is installed and launched **after** this, so it forks fresh and its system-trust-store HTTPS is decrypted. Per-host leaf certificates are short-lived and sent without the CA in the chain, to satisfy clients that enforce the 398-day maximum certificate validity.
 
