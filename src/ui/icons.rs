@@ -103,15 +103,12 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             );
         }
         Icon::Network => {
-            painter.circle_stroke(rect.center(), 6.5 * s, stroke);
-            line(painter, vec![p(1.0, 8.0), p(15.0, 8.0)], stroke);
-            // Meridians: a vertical line and an ellipse approximated by lines.
-            line(painter, vec![p(8.0, 1.5), p(8.0, 14.5)], stroke);
-            line(
-                painter,
-                vec![p(8.0, 1.5), p(4.5, 8.0), p(8.0, 14.5), p(11.5, 8.0), p(8.0, 1.5)],
-                stroke,
-            );
+            // Chevrons with three dots: < · · · >
+            line(painter, vec![p(4.5, 4.0), p(1.0, 8.0), p(4.5, 12.0)], stroke);
+            line(painter, vec![p(11.5, 4.0), p(15.0, 8.0), p(11.5, 12.0)], stroke);
+            for x in [5.6, 8.0, 10.4] {
+                painter.circle_filled(p(x, 8.0), 0.95 * s, color);
+            }
         }
         Icon::Lock => {
             painter.rect_stroke(
