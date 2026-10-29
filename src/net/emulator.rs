@@ -150,8 +150,11 @@ pub fn emulator_args(avd: &str, proxy_port: u16) -> Vec<String> {
 /// (a PEM certificate already pushed to `/data/local/tmp`) as a system trust
 /// anchor. On API 34+ the Conscrypt trust store lives in an APEX and each
 /// process has its own mount namespace, so a plain mount is not enough: an
-/// overlay directory (existing certs plus ours) is bind-mounted into the
-/// `zygote` namespace via `nsenter`, so apps forked afterwards trust it.
+/// overlay directory (existing certs plus ours) is bind-mounted over the
+/// system and Conscrypt trust stores in **every** process's mount namespace
+/// via `nsenter`. Covering every namespace (not just `zygote`) is required
+/// because apps can be forked from the pre-warmed USAP process pool, and
+/// already-running apps/system services otherwise keep the old store.
 pub fn ca_install_script(filename: &str) -> String {
     format!(
         r#"SRC=/data/local/tmp/{filename}
@@ -167,7 +170,10 @@ cp "$SYS"/* "$OVERLAY"/ 2>/dev/null
 cp "$SRC" "$OVERLAY"/{filename}
 chown root:root "$OVERLAY"/* 2>/dev/null
 chmod 644 "$OVERLAY"/*
-chcon u:object_r:system_security_cacerts_file:s0 "$OVERLAY"/* 2>/dev/null
+# Relabel the directory itself as well as the files: apps run in restricted
+# SELinux domains and are denied `search` on a `shell_data_file` directory,
+# so without this the mounted store is unreadable ("Trust anchor not found").
+chcon u:object_r:system_security_cacerts_file:s0 "$OVERLAY" "$OVERLAY"/* 2>/dev/null
 
 mount_dirs() {{
   PID="$1"
@@ -182,10 +188,20 @@ mount_dirs() {{
   done
 }}
 
-# Current namespace, then zygote (new apps inherit it) and system_server.
+# Mount in the init/global namespace first.
 mount_dirs ""
-for PID in $(pidof zygote64) $(pidof zygote) $(pidof system_server); do
-  mount_dirs "$PID"
+
+# Then propagate into every distinct process mount namespace. This covers
+# zygote/zygote64 (new apps inherit it), the pre-forked USAP pool, and every
+# already-running app and system service (which pick it up on their next TLS
+# handshake). Deduplicate by namespace id so each namespace is mounted once.
+SEEN=" "
+for P in /proc/[0-9]*; do
+  NS=$(readlink "$P/ns/mnt" 2>/dev/null)
+  [ -z "$NS" ] && continue
+  case "$SEEN" in *" $NS "*) continue;; esac
+  SEEN="$SEEN$NS "
+  mount_dirs "${{P#/proc/}}"
 done
 # Only report success if the overlay cert is actually present and non-empty.
 [ -s "$OVERLAY"/{filename} ] && echo INSTALLED"#
@@ -405,14 +421,16 @@ mod tests {
     }
 
     #[test]
-    fn ca_script_targets_both_stores_and_zygote() {
+    fn ca_script_targets_both_stores_and_all_namespaces() {
         let script = ca_install_script("b13f7cfc.0");
         assert!(script.contains("/system/etc/security/cacerts"));
         assert!(script.contains("/apex/com.android.conscrypt/cacerts"));
         assert!(script.contains("b13f7cfc.0"));
         assert!(script.contains("chcon u:object_r:system_security_cacerts_file"));
-        // Propagates into the zygote mount namespace so apps trust the CA.
-        assert!(script.contains("pidof zygote64"));
+        // Propagates into every process mount namespace (covers USAP pool and
+        // already-running apps), deduplicated by namespace id.
+        assert!(script.contains("/proc/[0-9]*"));
+        assert!(script.contains("ns/mnt"));
         assert!(script.contains("nsenter -t"));
         assert!(script.contains("echo INSTALLED"));
     }

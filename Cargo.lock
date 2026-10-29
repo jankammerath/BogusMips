@@ -580,6 +580,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "sha2",
+ "time",
  "webpki-roots",
  "windows-sys 0.59.0",
 ]

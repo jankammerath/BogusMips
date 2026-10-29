@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use md5::{Digest, Md5};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
-    KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
+    KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::crypto::ring::sign::any_supported_type;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
+use time::{Duration, OffsetDateTime};
 
 /// A generated CA and a cache of leaf certificates signed by it.
 pub struct CertAuthority {
@@ -37,9 +38,13 @@ fn ca_params() -> CertificateParams {
         KeyUsagePurpose::CrlSign,
         KeyUsagePurpose::DigitalSignature,
     ];
-    // A wide validity window avoids clock-skew surprises on emulators.
-    params.not_before = date_time_ymd(2020, 1, 1);
-    params.not_after = date_time_ymd(2040, 1, 1);
+    // The CA is generated fresh per capture session, so a short validity is
+    // fine — and required: Chromium/Cronet applies its ~398-day leaf-validity
+    // limit to the trust anchor too, rejecting a long-lived CA with
+    // ERR_CERT_VALIDITY_TOO_LONG. A one-day backdate absorbs emulator skew.
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - Duration::days(1);
+    params.not_after = now + Duration::days(300);
     params
 }
 
@@ -91,8 +96,12 @@ impl CertAuthority {
         params.distinguished_name.push(DnType::CommonName, host);
         params.subject_alt_names = vec![san_for(host)];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = date_time_ymd(2020, 1, 1);
-        params.not_after = date_time_ymd(2040, 1, 1);
+        // Chromium (WebView / Cronet) rejects leaf certificates whose validity
+        // period exceeds 398 days (ERR_CERT_VALIDITY_TOO_LONG), so keep the
+        // window well under that. A one-day backdate absorbs emulator clock skew.
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - Duration::days(1);
+        params.not_after = now + Duration::days(300);
 
         let leaf_key = KeyPair::generate().map_err(|e| e.to_string())?;
         let leaf: Certificate = params
@@ -102,7 +111,10 @@ impl CertAuthority {
         let key_der = PrivateKeyDer::try_from(leaf_key.serialize_der())
             .map_err(|e| format!("leaf key: {e}"))?;
         let signing_key = any_supported_type(&key_der).map_err(|e| e.to_string())?;
-        let chain = vec![leaf.der().clone(), self.ca_cert_der.clone()];
+        // Send only the leaf: the client already trusts our CA as a root, and
+        // including the long-lived CA in the chain makes Chromium/Cronet reject
+        // the whole chain with ERR_CERT_VALIDITY_TOO_LONG.
+        let chain = vec![leaf.der().clone()];
         Ok(CertifiedKey::new(chain, signing_key))
     }
 }
@@ -236,11 +248,11 @@ mod tests {
         let server = ServerConnection::new(server_config).unwrap();
         let client = handshake(client, server);
 
-        // The handshake completed and the presented cert chains to our CA.
+        // The handshake completed, proving the leaf validates against our CA
+        // (sent as the trust anchor, not in the presented chain).
         assert!(!client.is_handshaking());
         let chain = client.peer_certificates().expect("server cert");
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[1].as_ref(), ca.ca_cert_der());
+        assert_eq!(chain.len(), 1);
     }
 
     #[test]
