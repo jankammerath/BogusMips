@@ -40,98 +40,91 @@ pub fn frida_version() -> String {
 /// `ConnectionResult.SUCCESS` (0) and makes the common root-detection checks
 /// report an unrooted device.
 pub fn bypass_script() -> &'static str {
-    r#"Java.perform(function () {
+    r#"(function () {
+  // Remember what we've already hooked so re-applying never re-replaces an
+  // implementation (repeated replacement destabilises frida's trampolines).
+  var hooked = {};
   function hookReturn(className, method, value) {
+    var key = className + '#' + method;
+    if (hooked[key]) return;
     try {
       var cls = Java.use(className);
       if (!cls[method]) return;
       cls[method].overloads.forEach(function (ov) {
         ov.implementation = function () { return value; };
       });
+      hooked[key] = true;
     } catch (e) {
-      // Class or method not present in this app; ignore.
+      // Class or method not present / not loaded yet; a later pass may catch it.
     }
   }
 
-  // --- Google Play Services availability -> ConnectionResult.SUCCESS (0) ---
-  ['com.google.android.gms.common.GoogleApiAvailability',
-   'com.google.android.gms.common.GoogleApiAvailabilityLight',
-   'com.google.android.gms.common.GooglePlayServicesUtil',
-   'com.google.android.gms.common.GooglePlayServicesUtilLight'].forEach(function (c) {
-    hookReturn(c, 'isGooglePlayServicesAvailable', 0);
-  });
+  var buildDone = false;
+  var propsDone = false;
+  function applyHooks() {
+    // --- Google Play Services availability -> ConnectionResult.SUCCESS (0) ---
+    ['com.google.android.gms.common.GoogleApiAvailability',
+     'com.google.android.gms.common.GoogleApiAvailabilityLight',
+     'com.google.android.gms.common.GooglePlayServicesUtil',
+     'com.google.android.gms.common.GooglePlayServicesUtilLight'].forEach(function (c) {
+      hookReturn(c, 'isGooglePlayServicesAvailable', 0);
+    });
 
-  // --- RootBeer: every detection method reports "not rooted" ---
-  ['isRooted', 'isRootedWithBusyBoxCheck', 'isRootedWithoutBusyBoxCheck',
-   'detectRootManagementApps', 'detectPotentiallyDangerousApps', 'detectRootCloakingApps',
-   'detectTestKeys', 'checkForBusyBoxBinary', 'checkForSuBinary', 'checkSuExists',
-   'checkForRWPaths', 'checkForDangerousProps', 'checkForRootNative',
-   'checkForMagiskBinary', 'checkForBinary'].forEach(function (m) {
-    hookReturn('com.scottyab.rootbeer.RootBeer', m, false);
-  });
+    // --- RootBeer: every detection method reports "not rooted" (this also
+    // covers su-binary/busybox/magisk probes, so we avoid the crash-prone
+    // global File.exists / Runtime.exec overrides). ---
+    ['isRooted', 'isRootedWithBusyBoxCheck', 'isRootedWithoutBusyBoxCheck',
+     'detectRootManagementApps', 'detectPotentiallyDangerousApps', 'detectRootCloakingApps',
+     'detectTestKeys', 'checkForBusyBoxBinary', 'checkForSuBinary', 'checkSuExists',
+     'checkForRWPaths', 'checkForDangerousProps', 'checkForRootNative',
+     'checkForMagiskBinary', 'checkForBinary'].forEach(function (m) {
+      hookReturn('com.scottyab.rootbeer.RootBeer', m, false);
+    });
 
-  // --- Build fingerprint: hide the userdebug test-keys tag ---
-  try {
-    var Build = Java.use('android.os.Build');
-    Build.TAGS.value = 'release-keys';
-  } catch (e) {}
+    // --- Build fingerprint: hide the userdebug test-keys tag ---
+    if (!buildDone) {
+      try { Java.use('android.os.Build').TAGS.value = 'release-keys'; buildDone = true; } catch (e) {}
+    }
 
-  // --- Dangerous system properties report safe values ---
-  try {
-    var SystemProperties = Java.use('android.os.SystemProperties');
-    var safe = { 'ro.debuggable': '0', 'ro.secure': '1', 'service.adb.root': '0',
-                 'ro.build.tags': 'release-keys', 'ro.build.type': 'user',
-                 'ro.build.selinux': '1' };
-    SystemProperties.get.overload('java.lang.String').implementation = function (key) {
-      var k = '' + key;
-      if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
-      return this.get(key);
-    };
-    SystemProperties.get.overload('java.lang.String', 'java.lang.String').implementation = function (key, def) {
-      var k = '' + key;
-      if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
-      return this.get(key, def);
-    };
-  } catch (e) {}
-
-  // --- Hide root artifacts from File.exists() ---
-  try {
-    var File = Java.use('java.io.File');
-    var markers = ['su', 'magisk', 'superuser', 'supersu', 'busybox', 'xposed',
-                   'frida', '/sbin/.magisk', '/cache/.disable_magisk', 'Superuser.apk'];
-    File.exists.implementation = function () {
+    // --- Dangerous system properties report safe values ---
+    if (!propsDone) {
       try {
-        var path = ('' + this.getAbsolutePath()).toLowerCase();
-        for (var i = 0; i < markers.length; i++) {
-          if (path.indexOf(markers[i]) !== -1) return false;
-        }
+        var SystemProperties = Java.use('android.os.SystemProperties');
+        var safe = { 'ro.debuggable': '0', 'ro.secure': '1', 'service.adb.root': '0',
+                     'ro.build.tags': 'release-keys', 'ro.build.type': 'user',
+                     'ro.build.selinux': '1' };
+        SystemProperties.get.overload('java.lang.String').implementation = function (key) {
+          var k = '' + key;
+          if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
+          return this.get(key);
+        };
+        SystemProperties.get.overload('java.lang.String', 'java.lang.String').implementation = function (key, def) {
+          var k = '' + key;
+          if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
+          return this.get(key, def);
+        };
+        propsDone = true;
       } catch (e) {}
-      return this.exists();
-    };
-  } catch (e) {}
-
-  // --- Make `su` / `which su` / magisk shell-outs fail ---
-  function isRootCmd(s) {
-    if (s === null || s === undefined) return false;
-    s = '' + s;
-    return s === 'su' || /(^|\/)su(\s|$)/.test(s) || s.indexOf('which su') !== -1 ||
-           s.indexOf('busybox') !== -1 || s.indexOf('magisk') !== -1 || s.indexOf('Superuser') !== -1;
+    }
   }
-  try {
-    var Runtime = Java.use('java.lang.Runtime');
-    var IOException = Java.use('java.io.IOException');
-    Runtime.exec.overload('java.lang.String').implementation = function (cmd) {
-      if (isRootCmd(cmd)) throw IOException.$new('No such file or directory');
-      return this.exec(cmd);
-    };
-    Runtime.exec.overload('[Ljava.lang.String;').implementation = function (cmds) {
-      var joined = '';
-      try { joined = cmds ? cmds.join(' ') : ''; } catch (e) {}
-      if (isRootCmd(joined)) throw IOException.$new('No such file or directory');
-      return this.exec(cmds);
-    };
-  } catch (e) {}
-});
+
+  // The gadget is loaded via LD_PRELOAD before ART is initialised. Using the
+  // Java bridge too early aborts the process ("system_class_loader_ == nullptr
+  // implies IsAotCompiler"), and polling Java.available in a tight loop starves
+  // frida's own initialisation, so we simply defer with a few gently-spaced
+  // one-shot timers starting safely after ART is up (~1.5s). Re-applying is
+  // idempotent and catches classes (e.g. RootBeer) loaded a little later.
+  // NOTE: checks that run during very early app startup (before ~1.5s) can
+  // still win this race; beating those reliably needs frida spawn-gating.
+  var delays = [2000, 3500, 5500, 8000];
+  var i = 0;
+  function schedule() {
+    try { Java.perform(applyHooks); } catch (e) { /* ART not ready yet */ }
+    i += 1;
+    if (i < delays.length) setTimeout(schedule, delays[i] - delays[i - 1]);
+  }
+  setTimeout(schedule, delays[0]);
+})();
 "#
 }
 
