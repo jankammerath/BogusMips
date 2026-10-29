@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::ca::CertAuthority;
+use super::bypass;
 use super::capture::Capture;
 use super::emulator::{Emulator, Sdk};
 use super::proxy::Proxy;
@@ -25,6 +26,7 @@ pub enum Phase {
     EnablingRoot,
     InstallingCa,
     InstallingApp,
+    InstallingBypass,
     Launching,
     Capturing,
     Stopped,
@@ -41,6 +43,7 @@ impl Phase {
             Phase::EnablingRoot => "Enabling root",
             Phase::InstallingCa => "Installing the proxy certificate",
             Phase::InstallingApp => "Installing the app",
+            Phase::InstallingBypass => "Bypassing the Play Services check",
             Phase::Launching => "Launching the app",
             Phase::Capturing => "Capturing",
             Phase::Stopped => "Stopped",
@@ -80,6 +83,8 @@ pub struct StartConfig {
     pub apks: Vec<PathBuf>,
     /// Package to launch after install.
     pub package: Option<String>,
+    /// Inject the frida-gadget Play Services availability bypass before launch.
+    pub bypass_gms: bool,
 }
 
 pub struct NetworkController {
@@ -264,6 +269,24 @@ fn run_session(
         );
     }
     if let Some(package) = &config.package {
+        if config.bypass_gms {
+            let install_bypass = || -> Result<String, String> {
+                let abi = emulator.device_abi()?;
+                let frida_abi = bypass::frida_abi(&abi)
+                    .ok_or_else(|| format!("no frida gadget for this device ABI ({abi})"))?;
+                status
+                    .lock()
+                    .unwrap()
+                    .log("Downloading the Play Services bypass (frida gadget)…".to_owned());
+                let gadget = bypass::ensure_gadget(&bypass::cache_dir(), frida_abi)?;
+                emulator.install_gms_bypass(&gadget, package)
+            };
+            step!(
+                Phase::InstallingBypass,
+                "Bypassing the Play Services check",
+                install_bypass()
+            );
+        }
         step!(Phase::Launching, "Launching the app", emulator.launch(package));
     }
 
@@ -308,6 +331,7 @@ mod tests {
             avd: "x".into(),
             apks: vec![],
             package: None,
+            bypass_gms: false,
         });
         let (phase, error, _) = controller.status_snapshot();
         assert_eq!(phase, Phase::Failed);

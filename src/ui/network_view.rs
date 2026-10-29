@@ -17,6 +17,7 @@ pub struct NetworkViewState {
     pub avd: String,
     pub filter: String,
     pub log_expanded: bool,
+    pub bypass_gms: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +105,17 @@ pub fn show(
                             });
                         }
                     });
+            });
+            ui.add_space(6.0);
+
+            ui.add_enabled_ui(!running, |ui| {
+                ui.checkbox(&mut state.bypass_gms, "Bypass Play Services check")
+                    .on_hover_text(
+                        "Inject a frida gadget that makes Google Play Services \
+                         availability checks report success, so apps that abort \
+                         without Play Services keep running. Downloads the gadget \
+                         once (needs network and a rootable emulator).",
+                    );
             });
             ui.add_space(6.0);
 

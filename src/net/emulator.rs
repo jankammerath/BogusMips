@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use super::bypass;
+
 /// Host address the emulator uses to reach the machine it runs on.
 pub const HOST_ALIAS: &str = "10.0.2.2";
 
@@ -368,6 +370,51 @@ impl Emulator {
 
     pub fn clear_proxy(&self) {
         let _ = self.adb(&["shell", "settings", "put", "global", "http_proxy", ":0"]);
+    }
+
+    /// The device's primary ABI (e.g. `arm64-v8a`), used to pick the gadget.
+    pub fn device_abi(&self) -> Result<String, String> {
+        self.adb(&["shell", "getprop", "ro.product.cpu.abi"])
+            .map(|s| s.trim().to_owned())
+    }
+
+    /// Arms the Play Services availability bypass for `package`: pushes the
+    /// frida gadget, its config and the bypass script, and sets the
+    /// `wrap.<package>` property so the gadget is `LD_PRELOAD`ed when the app
+    /// next starts (which must be *after* this call).
+    pub fn install_gms_bypass(&self, gadget_local: &Path, package: &str) -> Step {
+        const GADGET: &str = "/data/local/tmp/bogusmips-gadget.so";
+        const SCRIPT: &str = "/data/local/tmp/bogusmips-gms-bypass.js";
+        // frida accepts either form; push both so it is found regardless.
+        const CONFIG: &str = "/data/local/tmp/bogusmips-gadget.config";
+        const CONFIG_SO: &str = "/data/local/tmp/bogusmips-gadget.config.so";
+
+        let local = gadget_local.to_string_lossy();
+        self.adb(&["push", &local, GADGET])?;
+        self.push_bytes(bypass::bypass_script().as_bytes(), SCRIPT)?;
+        let cfg = bypass::gadget_config(SCRIPT);
+        self.push_bytes(cfg.as_bytes(), CONFIG)?;
+        self.push_bytes(cfg.as_bytes(), CONFIG_SO)?;
+
+        // The app's SELinux domain must be able to read and execute the gadget;
+        // files left in /data/local/tmp carry `shell_data_file`, which apps may
+        // not map as code, so relabel them like app native libraries.
+        let _ = self.adb(&["shell", "chmod", "644", GADGET, SCRIPT, CONFIG, CONFIG_SO]);
+        let _ = self.adb(&[
+            "shell",
+            "chcon",
+            "u:object_r:apk_data_file:s0",
+            GADGET,
+            SCRIPT,
+            CONFIG,
+            CONFIG_SO,
+        ]);
+
+        let prop = format!("wrap.{package}");
+        let value = format!("LD_PRELOAD={GADGET}");
+        self.adb(&["shell", "setprop", &prop, &value])
+            .map_err(|e| format!("could not arm the bypass (setprop {prop}): {e}"))?;
+        Ok("Play Services bypass armed".into())
     }
 }
 

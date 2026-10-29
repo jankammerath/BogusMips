@@ -42,6 +42,8 @@ Caveats — what cannot be decrypted:
 
 What *is* decrypted: apps using the Android **system trust store** — `HttpURLConnection`, OkHttp/Retrofit, Conscrypt and most native networking. (Already-running cached system processes are not re-forked, so they may keep showing trust-anchor errors until restarted; this does not affect the launched target app.)
 
+**Bypassing the Play Services check.** Rootable `google_apis` emulators ship an older Google Play Services build than many apps are compiled against, so a `GoogleApiAvailability.isGooglePlayServicesAvailable()` check returns `SERVICE_VERSION_UPDATE_REQUIRED` and the app aborts before producing any traffic. Tick **Bypass Play Services check** before starting a capture to inject [frida-gadget](https://frida.re/docs/gadget/) into the target app (via the `wrap.<package>` property / `LD_PRELOAD`) with a small script that forces those checks to report success. It only makes the *presence* check pass — it does not provide the services — which is enough to keep root/environment checks from blocking analysis. The gadget is downloaded once (needs network access) and cached; it requires a rootable emulator.
+
 All parsers (ZIP, DEX, smali disassembler, binary XML, resource table) are implemented in this repository. They follow Android's behaviour rather than the specs, so tricks that break other tools still open. Examples: malformed extra fields, fake encryption flags, CRC mismatches, and bogus compression methods. Such tricks are reported as warnings.
 
 Names of Android framework resources come from `media/android/framework-resources.txt`, generated from the Android SDK with `tools/gen_framework_resources.py` (AOSP, Apache License 2.0).
@@ -78,7 +80,7 @@ cargo run --release --example search_package -- app.apk "getString" [--regex] [-
 # Open packages and inspect every node, reporting timings and decode errors
 cargo run --release --example inspect_all -- app.apk other.xapk
 # Capture an app's live HTTP/HTTPS traffic through the MITM proxy (headless)
-cargo run --example net_capture -- app.xapk <AVD-name> [seconds]
+cargo run --example net_capture -- app.xapk <AVD-name> [seconds] [--bypass]
 ```
 
 ## Project structure
@@ -93,6 +95,7 @@ src/
 ├── net/                 # Network view: emulator control + MITM proxy
 │   ├── mod.rs
 │   ├── ca.rs            # proxy CA + per-host leaf certificates (rcgen)
+│   ├── bypass.rs        # optional Play Services check bypass (frida-gadget)
 │   ├── http.rs          # HTTP/1.x request/response parsing (chunked, gzip)
 │   ├── proxy.rs         # MITM proxy: CONNECT, TLS terminate, re-originate, capture
 │   ├── capture.rs       # thread-safe captured-flow store

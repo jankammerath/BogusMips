@@ -11,9 +11,12 @@ use bogusmips::net::controller::{NetworkController, StartConfig};
 use bogusmips::package::{Package, PackageKind};
 
 fn main() {
-    let mut args = std::env::args().skip(1);
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let bypass_gms = args.iter().any(|a| a == "--bypass" || a == "bypass");
+    args.retain(|a| a != "--bypass" && a != "bypass");
+    let mut args = args.into_iter();
     let (Some(input), Some(avd)) = (args.next(), args.next()) else {
-        eprintln!("usage: net_capture <app.apk|xapk> <AVD> [seconds]");
+        eprintln!("usage: net_capture <app.apk|xapk> <AVD> [seconds] [--bypass]");
         std::process::exit(2);
     };
     let seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
@@ -53,6 +56,7 @@ fn main() {
         avd,
         apks,
         package: package_name,
+        bypass_gms,
     });
 
     let deadline = Instant::now() + Duration::from_secs(seconds);
