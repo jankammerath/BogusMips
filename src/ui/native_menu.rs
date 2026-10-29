@@ -43,6 +43,7 @@ impl NativeMenu {
             shift_shortcut(Code::KeyE),
         );
         let search = item("Search", MenuAction::ShowSearch, shift_shortcut(Code::KeyF));
+        let network = item("Network", MenuAction::ShowNetwork, shift_shortcut(Code::KeyN));
         let toggle_info = item(
             "Hide File Information",
             MenuAction::ToggleInfo,
@@ -73,7 +74,7 @@ impl NativeMenu {
             file.append_items(&[&open, &export, &separator(), &close, &separator(), &quit])
                 .ok()?;
         }
-        view.append_items(&[&explorer, &search, &separator(), &toggle_info])
+        view.append_items(&[&explorer, &search, &network, &separator(), &toggle_info])
             .ok()?;
         menu.append_items(&[&file, &view]).ok()?;
         if cfg!(target_os = "macos") {

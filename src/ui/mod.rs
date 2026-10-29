@@ -5,6 +5,8 @@ pub mod icons;
 pub mod info_panel;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod native_menu;
+pub mod net_detail;
+pub mod network_view;
 pub mod search_view;
 pub mod theme;
 pub mod tree_view;
@@ -18,5 +20,6 @@ pub enum MenuAction {
     Quit,
     ShowExplorer,
     ShowSearch,
+    ShowNetwork,
     ToggleInfo,
 }

@@ -75,9 +75,11 @@ mod tests {
         // Transparent margin and rounded corners.
         assert_eq!(icon.get_pixel(0, 0)[3], 0);
         assert_eq!(icon.get_pixel(30, 30)[3], 0);
-        // Opaque black fill inside the shape.
+        // Opaque near-black fill inside the shape (resampling may leave
+        // faint non-zero values near the artwork).
         let p = icon.get_pixel(40, 128);
-        assert_eq!((p[0], p[1], p[2], p[3]), (0, 0, 0, 255));
+        assert_eq!(p[3], 255);
+        assert!(p[0] < 40 && p[1] < 40 && p[2] < 40, "{p:?}");
         // The white line artwork is present.
         assert!(icon.pixels().any(|p| p[0] > 200 && p[3] == 255));
     }

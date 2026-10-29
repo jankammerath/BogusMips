@@ -7,9 +7,13 @@ use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 use crate::export::{self, ExportKind};
 use crate::inspect::{Content, Inspection, format_size, group_digits, inspect};
 use crate::package::{NodeId, Package, PackageKind};
+use crate::net::controller::{NetworkController, StartConfig};
+use crate::net::emulator::Avd;
 use crate::search::SearchController;
 use crate::ui::content_view::{self, Goto, ViewMode};
 use crate::ui::icons::{self, Icon};
+use crate::ui::net_detail::{self, FlowDetailState};
+use crate::ui::network_view::{self, NetworkAction, NetworkViewState};
 use crate::ui::search_view::{self, SearchAction, SearchViewState};
 use crate::ui::tree_view::{self, TreeState};
 use crate::ui::{MenuAction, info_panel, theme};
@@ -23,6 +27,8 @@ const SHOW_EXPLORER: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::E);
 const SHOW_SEARCH: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
+const SHOW_NETWORK: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::N);
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 
 /// The views of the left sidebar, selected in the activity bar.
@@ -30,6 +36,7 @@ const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 enum SideView {
     Explorer,
     Search,
+    Network,
 }
 
 /// Asks where to save an export, given the suggested file name.
@@ -57,6 +64,13 @@ struct Document {
     goto: Option<Goto>,
     search: SearchController,
     search_view: SearchViewState,
+    net: NetworkController,
+    net_view: NetworkViewState,
+    avds: Option<Vec<Avd>>,
+    selected_flow: Option<u64>,
+    flow_detail: FlowDetailState,
+    /// Temp APK files extracted for installation; cleaned up on drop.
+    net_tempdir: Option<PathBuf>,
 }
 
 impl Document {
@@ -70,6 +84,22 @@ impl Document {
             goto: None,
             search: SearchController::new(),
             search_view: SearchViewState::default(),
+            net: NetworkController::new(),
+            net_view: NetworkViewState::default(),
+            avds: None,
+            selected_flow: None,
+            flow_detail: FlowDetailState::default(),
+            net_tempdir: None,
+        }
+    }
+}
+
+impl Drop for Document {
+    fn drop(&mut self) {
+        // Stop any running capture before removing the extracted APKs.
+        self.net.stop();
+        if let Some(dir) = &self.net_tempdir {
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
@@ -146,6 +176,7 @@ impl BogusMipsApp {
             MenuAction::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             MenuAction::ShowExplorer => self.show_view(ctx, SideView::Explorer),
             MenuAction::ShowSearch => self.show_view(ctx, SideView::Search),
+            MenuAction::ShowNetwork => self.show_view(ctx, SideView::Network),
             MenuAction::ToggleInfo => self.show_info = !self.show_info,
         }
     }
@@ -290,12 +321,8 @@ impl BogusMipsApp {
     fn show_view(&mut self, ctx: &egui::Context, view: SideView) {
         self.show_sidebar = true;
         self.sidebar_view = view;
-        let focus = match view {
-            SideView::Explorer => tree_view::FILTER_ID,
-            SideView::Search => search_view::INPUT_ID,
-        };
         if view == SideView::Search {
-            ctx.memory_mut(|m| m.request_focus(egui::Id::new(focus)));
+            ctx.memory_mut(|m| m.request_focus(egui::Id::new(search_view::INPUT_ID)));
         }
     }
 
@@ -371,10 +398,11 @@ impl BogusMipsApp {
 
     fn handle_input(&mut self, ctx: &egui::Context) {
         // Shift variants first: shortcuts without Shift also match with it.
-        let (show_explorer, show_search) = ctx.input_mut(|i| {
+        let (show_explorer, show_search, show_network) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&SHOW_EXPLORER),
                 i.consume_shortcut(&SHOW_SEARCH),
+                i.consume_shortcut(&SHOW_NETWORK),
             )
         });
         if show_explorer {
@@ -382,6 +410,9 @@ impl BogusMipsApp {
         }
         if show_search {
             self.show_view(ctx, SideView::Search);
+        }
+        if show_network {
+            self.show_view(ctx, SideView::Network);
         }
         let (open, close, toggle_info, find, export, dropped) = ctx.input_mut(|i| {
             (
@@ -461,6 +492,13 @@ impl BogusMipsApp {
                 Some(&SHOW_SEARCH),
                 MenuAction::ShowSearch,
             );
+            entry(
+                ui,
+                "Network",
+                true,
+                Some(&SHOW_NETWORK),
+                MenuAction::ShowNetwork,
+            );
             ui.separator();
             entry(
                 ui,
@@ -500,6 +538,7 @@ impl BogusMipsApp {
         for (view, icon, tooltip) in [
             (SideView::Explorer, Icon::Files, "Explorer (⇧⌘E)"),
             (SideView::Search, Icon::Search, "Search (⇧⌘F)"),
+            (SideView::Network, Icon::Network, "Network (⇧⌘N)"),
         ] {
             let active = self.show_sidebar && self.sidebar_view == view;
             let (rect, response) = ui
@@ -581,7 +620,17 @@ impl BogusMipsApp {
     }
 
     fn info_panel(&mut self, ctx: &egui::Context) {
-        let inspection = self.document.as_ref().and_then(|d| d.inspection.as_ref());
+        // A selected flow's details, or the selected file's.
+        let (title, sections) = match &self.document {
+            Some(doc) => match doc.selected_flow.and_then(|id| doc.net.capture().get(id)) {
+                Some(flow) => ("Request information", Some(net_detail::flow_sections(&flow))),
+                None => (
+                    "File information",
+                    doc.inspection.as_ref().map(|i| i.sections.clone()),
+                ),
+            },
+            None => ("File information", None),
+        };
         let mut close = false;
         egui::SidePanel::right("info_panel")
             .resizable(true)
@@ -590,7 +639,7 @@ impl BogusMipsApp {
             .show_separator_line(false)
             .frame(theme::card(theme::SIDEBAR))
             .show(ctx, |ui| {
-                close = info_panel::show(ui, inspection);
+                close = info_panel::show(ui, title, sections.as_deref());
             });
         if close {
             self.show_info = false;
@@ -602,6 +651,7 @@ impl BogusMipsApp {
     fn sidebar(&mut self, ctx: &egui::Context) {
         let mut pick = false;
         let mut search_action = None;
+        let mut net_action = None;
         let mut toggle = None;
         let panel = if self.show_sidebar {
             egui::SidePanel::left("sidebar")
@@ -664,6 +714,24 @@ impl BogusMipsApp {
                             .map(|d| (&*d.package, &mut d.search, &mut d.search_view));
                         search_action = search_view::show(ui, doc);
                     }
+                    (SideView::Network, Some(doc)) => {
+                        if doc.avds.is_none() {
+                            doc.avds =
+                                Some(doc.net.sdk().map(|s| s.list_avds()).unwrap_or_default());
+                        }
+                        net_action = network_view::show(
+                            ui,
+                            Some((
+                                &doc.net,
+                                doc.avds.as_deref().unwrap_or_default(),
+                                &mut doc.net_view,
+                                doc.selected_flow,
+                            )),
+                        );
+                    }
+                    (SideView::Network, None) => {
+                        net_action = network_view::show(ui, None);
+                    }
                 }
             });
         if let Some(view) = toggle {
@@ -683,8 +751,61 @@ impl BogusMipsApp {
             Some(SearchAction::PickFile) => pick = true,
             None => {}
         }
+        match net_action {
+            Some(NetworkAction::PickFile) => pick = true,
+            Some(NetworkAction::StartStop) => self.toggle_capture(),
+            Some(NetworkAction::Clear) => {
+                if let Some(doc) = &mut self.document {
+                    doc.net.capture().clear();
+                    doc.selected_flow = None;
+                }
+            }
+            Some(NetworkAction::SelectFlow(id)) => {
+                if let Some(doc) = &mut self.document {
+                    doc.selected_flow = Some(id);
+                    doc.flow_detail = FlowDetailState::default();
+                }
+            }
+            Some(NetworkAction::SaveCa) => self.save_ca(),
+            None => {}
+        }
         if pick {
             self.pick_file();
+        }
+    }
+
+    /// Starts or stops the capture for the open package.
+    fn toggle_capture(&mut self) {
+        let Some(doc) = &mut self.document else {
+            return;
+        };
+        if doc.net.is_running() {
+            doc.net.stop();
+            return;
+        }
+        let avd = doc.net_view.avd.clone();
+        if avd.is_empty() {
+            return;
+        }
+        match build_start_config(&doc.package, avd) {
+            Ok((config, tempdir)) => {
+                if let Some(dir) = doc.net_tempdir.replace(tempdir) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                doc.net.start(config);
+            }
+            Err(e) => self.error = Some(("Could not start capture", e)),
+        }
+    }
+
+    fn save_ca(&mut self) {
+        let Some(doc) = &self.document else { return };
+        let pem = doc.net.ca_pem().to_owned();
+        if let Some(path) = (self.save_dialog)("BogusMips-Proxy-CA.pem") {
+            match std::fs::write(&path, pem) {
+                Ok(()) => self.notice = Some(format!("Saved the CA certificate to {}", path.display())),
+                Err(e) => self.error = Some(("Could not save the certificate", e.to_string())),
+            }
         }
     }
 
@@ -694,14 +815,19 @@ impl BogusMipsApp {
             .frame(theme::card(theme::EDITOR))
             .show(ctx, |ui| match &mut self.document {
                 Some(doc) => {
-                    let response = content_view::show(
-                        ui,
-                        doc.inspection.as_ref(),
-                        &mut doc.view_mode,
-                        doc.goto.as_mut(),
-                        self.show_info,
-                    );
-                    if response.close {
+                    let flow = doc.selected_flow.and_then(|id| doc.net.capture().get(id));
+                    let response = if let Some(flow) = flow {
+                        net_detail::show(ui, &flow, &mut doc.flow_detail, self.show_info)
+                    } else {
+                        content_view::show(
+                            ui,
+                            doc.inspection.as_ref(),
+                            &mut doc.view_mode,
+                            doc.goto.as_mut(),
+                            self.show_info,
+                        )
+                    };
+                    if response.close && doc.selected_flow.take().is_none() {
                         deselect(ctx, doc);
                     }
                     toggle_info = response.toggle_info;
@@ -776,6 +902,52 @@ impl BogusMipsApp {
     }
 }
 
+/// Extracts the APK(s) to install and the package name for a capture session.
+fn build_start_config(
+    package: &Package,
+    avd: String,
+) -> Result<(StartConfig, PathBuf), String> {
+    use crate::package::PackageKind;
+    let tempdir = std::env::temp_dir().join(format!(
+        "bogusmips-net-{}-{}",
+        std::process::id(),
+        package.archives.first().map_or(0, |a| a.size)
+    ));
+    std::fs::create_dir_all(&tempdir).map_err(|e| e.to_string())?;
+
+    let mut apks = Vec::new();
+    match package.kind {
+        PackageKind::Apk => apks.push(package.path.clone()),
+        PackageKind::Xapk => {
+            // The inner APKs (base + splits) are extracted to temp files.
+            for (i, archive) in package.archives.iter().enumerate().skip(1) {
+                if let Some(file) = archive.source_file {
+                    let data = package.read_file(file)?;
+                    let out = tempdir.join(format!("part{i}.apk"));
+                    std::fs::write(&out, &data.bytes).map_err(|e| e.to_string())?;
+                    apks.push(out);
+                }
+            }
+        }
+    }
+    if apks.is_empty() {
+        return Err("No APK found to install.".to_owned());
+    }
+    let package_name = package
+        .archives
+        .iter()
+        .find_map(|a| a.manifest.as_ref().and_then(|m| m.package.clone()));
+
+    Ok((
+        StartConfig {
+            avd,
+            apks,
+            package: package_name,
+        },
+        tempdir,
+    ))
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -791,6 +963,7 @@ fn select(ctx: &egui::Context, doc: &mut Document, node: NodeId) {
         ctx.forget_image(uri);
     }
     doc.selected = Some(node);
+    doc.selected_flow = None;
     doc.tree.reveal(&doc.package, node);
     // Parsers are hardened against hostile input; this is a last line of
     // defense so a missed edge case cannot take down the whole app.
@@ -852,6 +1025,9 @@ impl BogusMipsApp {
         self.poll_loading(ctx);
         if let Some(doc) = &mut self.document {
             doc.search.poll(&doc.package, ctx);
+            if doc.net.is_running() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            }
         }
 
         // Panel order matters: full-width bars first, then the columns.
@@ -1431,6 +1607,52 @@ mod tests {
         let raw = std::fs::read_to_string(out_dir.join("config.json")).unwrap();
         assert_eq!(raw, r#"{"a":1}"#);
         std::fs::remove_dir_all(&out_dir).unwrap();
+    }
+
+    #[test]
+    fn network_view_lists_flows_and_opens_detail() {
+        use crate::net::capture::{RequestInfo, Scheme};
+        use crate::net::http::{Request, Response};
+        use std::io::BufReader;
+
+        let zip = crate::formats::zip::write_stored_zip(&[("a.txt", b"x")]);
+        let package = Package::from_bytes(Path::new("t.apk"), zip.into()).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let doc = Document::new(package);
+
+        // Inject a captured HTTPS flow.
+        let request = Request::read(&mut BufReader::new(
+            &b"GET /v1/items HTTP/1.1\r\nHost: api.example\r\n\r\n"[..],
+        ))
+        .unwrap()
+        .unwrap();
+        let info = RequestInfo::from_request(Scheme::Https, "api.example:443", &request, 40);
+        let pending = doc.net.capture().start(&info);
+        let response = Response::read(
+            &mut BufReader::new(&b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"[..]),
+            "GET",
+        )
+        .unwrap();
+        doc.net.capture().finish_response(&pending, &response, 20);
+        app.document = Some(doc);
+        app.show_view(&ctx, SideView::Network);
+
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        // The sidebar lists the request (host and method).
+        assert!(texts.iter().any(|(_, t)| t == "api.example"), "flow not listed: {texts:?}");
+        let (row, _) = texts
+            .iter()
+            .find(|(_, t)| t == "api.example")
+            .unwrap();
+        let _ = ctx.run(input(click(*row + egui::vec2(0.0, 8.0))), |ctx| app.ui(ctx));
+        assert_eq!(app.document.as_ref().unwrap().selected_flow, Some(0));
+
+        // The editor shows the flow detail with its URL and tabs.
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        assert!(texts.iter().any(|(_, t)| t == "https://api.example/v1/items"), "{texts:?}");
+        assert!(texts.iter().any(|(_, t)| t == "Overview"));
+        assert!(texts.iter().any(|(_, t)| t == "Response"));
     }
 
     fn node_named(package: &Package, label: &str) -> NodeId {

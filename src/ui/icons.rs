@@ -11,6 +11,10 @@ pub enum Icon {
     Close,
     PanelRight,
     Copy,
+    Network,
+    Lock,
+    Trash,
+    Download,
 }
 
 fn line(painter: &Painter, points: Vec<Pos2>, stroke: Stroke) {
@@ -97,6 +101,48 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 ],
                 stroke,
             );
+        }
+        Icon::Network => {
+            painter.circle_stroke(rect.center(), 6.5 * s, stroke);
+            line(painter, vec![p(1.0, 8.0), p(15.0, 8.0)], stroke);
+            // Meridians: a vertical line and an ellipse approximated by lines.
+            line(painter, vec![p(8.0, 1.5), p(8.0, 14.5)], stroke);
+            line(
+                painter,
+                vec![p(8.0, 1.5), p(4.5, 8.0), p(8.0, 14.5), p(11.5, 8.0), p(8.0, 1.5)],
+                stroke,
+            );
+        }
+        Icon::Lock => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(3.5, 7.0), p(12.5, 14.5)),
+                1.0,
+                stroke,
+                eframe::egui::StrokeKind::Middle,
+            );
+            // Shackle.
+            line(
+                painter,
+                vec![p(5.0, 7.0), p(5.0, 5.0), p(5.5, 3.5), p(7.0, 2.5), p(9.0, 2.5), p(10.5, 3.5), p(11.0, 5.0), p(11.0, 7.0)],
+                stroke,
+            );
+        }
+        Icon::Trash => {
+            line(painter, vec![p(2.5, 3.5), p(13.5, 3.5)], stroke);
+            line(painter, vec![p(6.0, 3.5), p(6.5, 2.0), p(9.5, 2.0), p(10.0, 3.5)], stroke);
+            line(
+                painter,
+                vec![p(3.5, 3.5), p(4.5, 14.0), p(11.5, 14.0), p(12.5, 3.5)],
+                stroke,
+            );
+            for x in [6.5, 8.0, 9.5] {
+                line(painter, vec![p(x, 5.5), p(x, 12.0)], stroke);
+            }
+        }
+        Icon::Download => {
+            line(painter, vec![p(8.0, 2.0), p(8.0, 10.5)], stroke);
+            line(painter, vec![p(4.0, 7.0), p(8.0, 10.5), p(12.0, 7.0)], stroke);
+            line(painter, vec![p(2.5, 13.5), p(13.5, 13.5)], stroke);
         }
     }
 }

@@ -20,6 +20,7 @@ pub const TEXT_DIM: Color32 = Color32::from_rgb(0x9d, 0x9d, 0x9d);
 pub const TEXT_BRIGHT: Color32 = Color32::WHITE;
 pub const LINK: Color32 = Color32::from_rgb(0x37, 0x94, 0xff);
 pub const ACCENT: Color32 = Color32::from_rgb(0x00, 0x7a, 0xcc);
+pub const ERROR: Color32 = Color32::from_rgb(0xf4, 0x87, 0x71);
 pub const FOCUS: Color32 = Color32::from_rgb(0x00, 0x7f, 0xd4);
 pub const BUTTON: Color32 = Color32::from_rgb(0x0e, 0x63, 0x9c);
 pub const BUTTON_HOVER: Color32 = Color32::from_rgb(0x11, 0x77, 0xbb);

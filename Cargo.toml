@@ -11,10 +11,15 @@ eframe = "0.32.3"
 egui_extras = { version = "0.32", features = ["image"] }
 flate2 = "1.1.10"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+md-5 = "0.10"
 raw-window-handle = "0.6"
+rcgen = { version = "0.14.7", default-features = false, features = ["ring", "pem"] }
 regex = "1.13.1"
 rfd = "0.17.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
 sha2 = "0.11.0"
+webpki-roots = "1"
 
 [profile.release]
 lto = true

@@ -26,6 +26,14 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
   - A hex view is available for any file.
 - **Right: collapsible file information** (⌘I): size, compression, CRC, SHA-256, DEX header details, class details, manifest summary, permissions, and any anomalies found.
 
+### Network
+
+The **Network** view (⇧⌘N) is a stripped-down, Postman-like traffic sniffer. It starts an Android emulator (AVD), routes the guest's traffic through a built-in man-in-the-middle proxy, installs the open APK/XAPK, launches it, and captures its HTTP **and HTTPS** requests live. Captured requests appear in a list on the left; selecting one shows its full request/response (headers and body, pretty / raw / hex) in the editor, with timing and connection details in the information panel.
+
+Full HTTPS decryption requires a **rootable** emulator image (`google_apis` / `aosp_atd`, *not* `google_apis_playstore`), because the proxy's CA must be installed as a system trust anchor. On start, BogusMips enables `adb root`, installs its generated CA into the system and Conscrypt (APEX) trust stores, and — on Android 14+ (API 34+), where the trust store lives in a per-process mount namespace — propagates the mount into the `zygote` namespace with `nsenter` so apps forked afterwards trust it. The target app is installed and launched **after** this, so it forks fresh from the patched `zygote` and its system-trust-store HTTPS is decrypted.
+
+Caveats: apps that use their own certificate store rather than the system one (e.g. Chrome, or apps with certificate pinning) are not decryptable. Already-running cached system processes (e.g. the connectivity `NetworkMonitor`) are not re-forked, so their traffic may still show trust-anchor errors; this does not affect the launched app.
+
 All parsers (ZIP, DEX, smali disassembler, binary XML, resource table) are implemented in this repository. They follow Android's behaviour rather than the specs, so tricks that break other tools still open. Examples: malformed extra fields, fake encryption flags, CRC mismatches, and bogus compression methods. Such tricks are reported as warnings.
 
 Names of Android framework resources come from `media/android/framework-resources.txt`, generated from the Android SDK with `tools/gen_framework_resources.py` (AOSP, Apache License 2.0).
@@ -61,6 +69,8 @@ cargo run --release --example beautify_file -- in.min.js out.js [json|xml|html|c
 cargo run --release --example search_package -- app.apk "getString" [--regex] [--case] [--word]
 # Open packages and inspect every node, reporting timings and decode errors
 cargo run --release --example inspect_all -- app.apk other.xapk
+# Capture an app's live HTTP/HTTPS traffic through the MITM proxy (headless)
+cargo run --example net_capture -- app.xapk <AVD-name> [seconds]
 ```
 
 ## Project structure
@@ -72,6 +82,14 @@ src/
 ├── app.rs               # application state, menus, panels, background loading
 ├── inspect.rs           # turns a tree node into content + file information
 ├── search.rs            # content search: background index, regex search
+├── net/                 # Network view: emulator control + MITM proxy
+│   ├── mod.rs
+│   ├── ca.rs            # proxy CA + per-host leaf certificates (rcgen)
+│   ├── http.rs          # HTTP/1.x request/response parsing (chunked, gzip)
+│   ├── proxy.rs         # MITM proxy: CONNECT, TLS terminate, re-originate, capture
+│   ├── capture.rs       # thread-safe captured-flow store
+│   ├── emulator.rs      # adb/emulator control (root, CA install, proxy, launch)
+│   └── controller.rs    # background start/stop orchestration state machine
 ├── beautify/            # whitespace-only pretty-printers: JSON, XML/HTML, CSS, JavaScript
 ├── package/
 │   ├── mod.rs           # APK/XAPK loading, entry extraction, manifest summary
@@ -97,6 +115,8 @@ src/
     ├── content_view.rs  # center panel (text, hex, image)
     ├── info_panel.rs    # right panel
     ├── search_view.rs   # sidebar search view
+    ├── network_view.rs  # sidebar network view (request list, AVD controls)
+    ├── net_detail.rs    # editor view for a captured request/response
     ├── icons.rs         # vector icons (codicon style)
     ├── native_menu.rs   # native application menu (macOS menu bar, Windows menu bar)
     └── highlight.rs     # smali / XML syntax highlighting

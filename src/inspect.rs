@@ -58,20 +58,21 @@ impl Content {
     }
 }
 
+#[derive(Clone)]
 pub struct InfoSection {
     pub title: String,
     pub rows: Vec<(String, String)>,
 }
 
 impl InfoSection {
-    fn new(title: impl Into<String>) -> Self {
+    pub fn new(title: impl Into<String>) -> Self {
         Self {
             title: title.into(),
             rows: Vec::new(),
         }
     }
 
-    fn row(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
+    pub fn row(&mut self, key: impl Into<String>, value: impl Into<String>) -> &mut Self {
         self.rows.push((key.into(), value.into()));
         self
     }

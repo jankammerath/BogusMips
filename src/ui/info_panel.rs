@@ -5,10 +5,10 @@ use eframe::egui::{self, CornerRadius, RichText, ScrollArea, Sense, vec2};
 use super::icons::{self, Icon};
 use super::theme;
 use super::tree_view::paint_chevron;
-use crate::inspect::Inspection;
+use crate::inspect::InfoSection;
 
 /// Shows the panel. Returns `true` if the close button was clicked.
-pub fn show(ui: &mut egui::Ui, inspection: Option<&Inspection>) -> bool {
+pub fn show(ui: &mut egui::Ui, title: &str, sections: Option<&[InfoSection]>) -> bool {
     let mut close = false;
     // Header: a label pill (like VS Code's "Chat") and a close button.
     ui.add_space(4.0);
@@ -17,7 +17,7 @@ pub fn show(ui: &mut egui::Ui, inspection: Option<&Inspection>) -> bool {
         let font = egui::FontId::proportional(12.0);
         let galley = ui
             .painter()
-            .layout_no_wrap("File information".to_owned(), font, theme::TEXT);
+            .layout_no_wrap(title.to_owned(), font, theme::TEXT);
         let (pill, _) = ui.allocate_exact_size(galley.size() + vec2(14.0, 8.0), Sense::hover());
         ui.painter()
             .rect_filled(pill, CornerRadius::same(4), theme::PILL);
@@ -42,14 +42,14 @@ pub fn show(ui: &mut egui::Ui, inspection: Option<&Inspection>) -> bool {
                     bottom: 8,
                 })
                 .show(ui, |ui| {
-                    let Some(inspection) = inspection else {
+                    let Some(sections) = sections else {
                         ui.label(
                             RichText::new("Select a file or class to see its details.")
                                 .color(theme::TEXT_DIM),
                         );
                         return;
                     };
-                    for (i, section) in inspection.sections.iter().enumerate() {
+                    for (i, section) in sections.iter().enumerate() {
                         egui::CollapsingHeader::new(
                             RichText::new(section.title.to_uppercase())
                                 .size(11.0)
