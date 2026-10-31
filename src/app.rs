@@ -123,6 +123,8 @@ pub struct BogusMipsApp {
     right_tab: RightTab,
     agent: AgentController,
     agent_view: AgentPanelState,
+    frida_config: crate::net::bypass::FridaConfig,
+    persist_frida: bool,
     show_sidebar: bool,
     sidebar_view: SideView,
     /// Where the activity bar icons were drawn (for tests).
@@ -137,6 +139,8 @@ impl BogusMipsApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
         #[allow(unused_mut)]
         let mut app = Self::with_context(&cc.egui_ctx, initial_file);
+        app.frida_config = crate::net::bypass::FridaConfig::load();
+        app.persist_frida = true;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
             app.native_menu = crate::ui::native_menu::NativeMenu::install(cc);
@@ -210,6 +214,8 @@ impl BogusMipsApp {
             right_tab: RightTab::default(),
             agent: AgentController::new(),
             agent_view: AgentPanelState::default(),
+            frida_config: crate::net::bypass::FridaConfig::default(),
+            persist_frida: false,
             show_sidebar: true,
             sidebar_view: SideView::Explorer,
             activity_icons: Vec::new(),
@@ -250,6 +256,8 @@ impl BogusMipsApp {
                 let title = format!("{} — BogusMips", package.archives[0].name);
                 self.set_title(ctx, title);
                 let mut doc = Document::new(package);
+                doc.net_view =
+                    NetworkViewState::from_config(&self.frida_config, self.persist_frida);
                 select(ctx, &mut doc, root);
                 self.document = Some(doc);
                 self.loading = None;
@@ -270,7 +278,8 @@ impl BogusMipsApp {
     }
 
     fn close(&mut self, ctx: &egui::Context) {
-        if self.document.take().is_some() {
+        if let Some(doc) = self.document.take() {
+            self.frida_config = doc.net_view.to_config();
             ctx.forget_all_images();
             self.set_title(ctx, "BogusMips".to_owned());
         }
@@ -831,6 +840,17 @@ impl BogusMipsApp {
         }
         match net_action {
             Some(NetworkAction::PickFile) => pick = true,
+            Some(NetworkAction::PickFridaScript) => {
+                if let Some(path) = rfd::FileDialog::new()
+                    .set_title("Add Frida script")
+                    .add_filter("Frida script (*.js)", &["js"])
+                    .pick_file()
+                {
+                    if let Some(doc) = &mut self.document {
+                        let _ = doc.net_view.add_script(&path.to_string_lossy());
+                    }
+                }
+            }
             Some(NetworkAction::StartStop) => self.toggle_capture(),
             Some(NetworkAction::Clear) => {
                 if let Some(doc) = &mut self.document {
@@ -865,7 +885,12 @@ impl BogusMipsApp {
         if avd.is_empty() {
             return;
         }
-        match build_start_config(&doc.package, avd, doc.net_view.bypass_checks) {
+        match build_start_config(
+            &doc.package,
+            avd,
+            doc.net_view.bypass_checks,
+            doc.net_view.enabled_scripts(),
+        ) {
             Ok((config, tempdir)) => {
                 if let Some(dir) = doc.net_tempdir.replace(tempdir) {
                     let _ = std::fs::remove_dir_all(dir);
@@ -985,6 +1010,7 @@ fn build_start_config(
     package: &Package,
     avd: String,
     bypass_checks: bool,
+    frida_scripts: Vec<String>,
 ) -> Result<(StartConfig, PathBuf), String> {
     use crate::package::PackageKind;
     let tempdir = std::env::temp_dir().join(format!(
@@ -1023,6 +1049,7 @@ fn build_start_config(
             apks,
             package: package_name,
             bypass_checks,
+            frida_scripts,
         },
         tempdir,
     ))
@@ -1734,6 +1761,59 @@ mod tests {
         assert!(texts.iter().any(|(_, t)| t == "https://api.example/v1/items"), "{texts:?}");
         assert!(texts.iter().any(|(_, t)| t == "Overview"));
         assert!(texts.iter().any(|(_, t)| t == "Response"));
+    }
+
+    #[test]
+    fn network_view_manages_user_frida_scripts() {
+        let zip = crate::formats::zip::write_stored_zip(&[("a.txt", b"x")]);
+        let package = Package::from_bytes(Path::new("t.apk"), zip.into()).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        app.document = Some(Document::new(package));
+        app.show_view(&ctx, SideView::Network);
+
+        // Focus the Frida script input box, enter a CLI-style codeshare spec, and click Add.
+        ctx.memory_mut(|m| {
+            m.request_focus(egui::Id::new(network_view::FRIDA_SCRIPT_INPUT_ID))
+        });
+        let _ = ctx.run(
+            input(vec![egui::Event::Text(
+                "frida --codeshare dzonerzy/aesinfo".into(),
+            )]),
+            |ctx| app.ui(ctx),
+        );
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        let (add_pos, _) = texts
+            .iter()
+            .find(|(_, t)| t == "Add")
+            .expect("Add button drawn");
+        let _ = ctx.run(input(click(*add_pos + egui::vec2(6.0, 6.0))), |ctx| {
+            app.ui(ctx)
+        });
+
+        let doc = app.document.as_ref().unwrap();
+        assert_eq!(doc.net_view.enabled_scripts(), vec!["dzonerzy/aesinfo"]);
+
+        // Add a second script and toggle the first one off via its checkbox.
+        app.document
+            .as_mut()
+            .unwrap()
+            .net_view
+            .add_script("/tmp/custom_hook.js")
+            .unwrap();
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        assert!(texts.iter().any(|(_, t)| t == "dzonerzy/aesinfo"));
+        assert!(texts.iter().any(|(_, t)| t == "/tmp/custom_hook.js"));
+
+        let (cb_pos, _) = texts
+            .iter()
+            .find(|(_, t)| t == "dzonerzy/aesinfo")
+            .unwrap();
+        let _ = ctx.run(input(click(*cb_pos + egui::vec2(4.0, 4.0))), |ctx| {
+            app.ui(ctx)
+        });
+        let doc = app.document.as_ref().unwrap();
+        assert_eq!(doc.net_view.enabled_scripts(), vec!["/tmp/custom_hook.js"]);
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl Status {
 }
 
 /// What to capture.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct StartConfig {
     pub avd: String,
     /// APK file paths to install (base + splits); empty to sniff without
@@ -85,6 +85,10 @@ pub struct StartConfig {
     pub package: Option<String>,
     /// Inject the frida-gadget Play Services availability bypass before launch.
     pub bypass_checks: bool,
+    /// Enabled user-defined Frida scripts (CodeShare slugs like
+    /// `dzonerzy/aesinfo`, URLs, or local `.js` paths) to inject via
+    /// `frida-gadget`.
+    pub frida_scripts: Vec<String>,
 }
 
 pub struct NetworkController {
@@ -268,31 +272,59 @@ fn run_session(
             emulator.install_app(&config.apks)
         );
     }
+    let needs_frida = config.bypass_checks || !config.frida_scripts.is_empty();
     if let Some(package) = &config.package {
-        if config.bypass_checks {
-            let install_bypass = || -> Result<String, String> {
+        if needs_frida {
+            let install_frida = || -> Result<String, String> {
                 let abi = emulator.device_abi()?;
                 let frida_abi = bypass::frida_abi(&abi)
                     .ok_or_else(|| format!("no frida gadget for this device ABI ({abi})"))?;
+                let cache = bypass::cache_dir();
                 status
                     .lock()
                     .unwrap()
-                    .log("Downloading the bypass (frida gadget)…".to_owned());
-                let gadget = bypass::ensure_gadget(&bypass::cache_dir(), frida_abi)?;
-                emulator.install_bypass(&gadget, package)
+                    .log("Downloading the frida gadget…".to_owned());
+                let gadget = bypass::ensure_gadget(&cache, frida_abi)?;
+                let mut loaded = Vec::with_capacity(config.frida_scripts.len());
+                for spec in &config.frida_scripts {
+                    status
+                        .lock()
+                        .unwrap()
+                        .log(format!("Loading Frida script {spec}…"));
+                    loaded.push(bypass::load_script(&cache, spec)?);
+                }
+                let combined = bypass::build_gadget_script(config.bypass_checks, &loaded);
+                emulator.clear_logcat();
+                emulator.install_frida_script(&gadget, package, &combined)
             };
-            step!(
-                Phase::InstallingBypass,
-                "Bypassing Play Services and root checks",
-                install_bypass()
-            );
+            let label = match (config.bypass_checks, config.frida_scripts.len()) {
+                (true, 0) => "Bypassing Play Services and root checks".to_owned(),
+                (false, n) => format!("Injecting {n} Frida script(s)"),
+                (true, n) => format!(
+                    "Bypassing Play Services/root checks and injecting {n} Frida script(s)"
+                ),
+            };
+            step!(Phase::InstallingBypass, &label, install_frida());
         }
         step!(Phase::Launching, "Launching the app", emulator.launch(package));
     }
 
     set_phase(Phase::Capturing, "Capturing traffic");
+    let mut frida_seen = 0usize;
+    let mut tick = 0u32;
     while !is_cancelled() {
         std::thread::sleep(Duration::from_millis(200));
+        tick = tick.wrapping_add(1);
+        if needs_frida && tick % 5 == 0 {
+            let lines = emulator.frida_log_lines();
+            if lines.len() > frida_seen {
+                let mut s = status.lock().unwrap();
+                for line in &lines[frida_seen..] {
+                    s.log(format!("[frida] {line}"));
+                }
+                frida_seen = lines.len();
+            }
+        }
     }
     // Dropping `emulator` clears the proxy setting and shuts it down; dropping
     // `proxy` stops the listener.
@@ -332,6 +364,7 @@ mod tests {
             apks: vec![],
             package: None,
             bypass_checks: false,
+            frida_scripts: Vec::new(),
         });
         let (phase, error, _) = controller.status_snapshot();
         assert_eq!(phase, Phase::Failed);

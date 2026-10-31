@@ -383,6 +383,18 @@ impl Emulator {
     /// and sets the `wrap.<package>` property so the gadget is `LD_PRELOAD`ed
     /// when the app next starts (which must be *after* this call).
     pub fn install_bypass(&self, gadget_local: &Path, package: &str) -> Step {
+        self.install_frida_script(gadget_local, package, bypass::bypass_script())
+    }
+
+    /// Pushes `gadget_local`, its config, and the assembled `script_js` (the
+    /// built-in bypass and/or user-selected Frida scripts), then sets
+    /// `wrap.<package>` so `frida-gadget` is `LD_PRELOAD`ed on app launch.
+    pub fn install_frida_script(
+        &self,
+        gadget_local: &Path,
+        package: &str,
+        script_js: &str,
+    ) -> Step {
         const GADGET: &str = "/data/local/tmp/bogusmips-gadget.so";
         const SCRIPT: &str = "/data/local/tmp/bogusmips-bypass.js";
         // frida accepts either form; push both so it is found regardless.
@@ -391,7 +403,7 @@ impl Emulator {
 
         let local = gadget_local.to_string_lossy();
         self.adb(&["push", &local, GADGET])?;
-        self.push_bytes(bypass::bypass_script().as_bytes(), SCRIPT)?;
+        self.push_bytes(script_js.as_bytes(), SCRIPT)?;
         let cfg = bypass::gadget_config(SCRIPT);
         self.push_bytes(cfg.as_bytes(), CONFIG)?;
         self.push_bytes(cfg.as_bytes(), CONFIG_SO)?;
@@ -414,7 +426,26 @@ impl Emulator {
         let value = format!("LD_PRELOAD={GADGET}");
         self.adb(&["shell", "setprop", &prop, &value])
             .map_err(|e| format!("could not arm the bypass (setprop {prop}): {e}"))?;
-        Ok("bypass armed".into())
+        Ok("Frida gadget armed".into())
+    }
+
+    /// Clears the device's logcat ring buffer before launching the instrumented
+    /// app so subsequent [`Self::frida_log_lines`] calls only return fresh output.
+    pub fn clear_logcat(&self) {
+        let _ = self.adb(&["logcat", "-c"]);
+    }
+
+    /// Returns lines logged by `frida-gadget` (`console.log` / `send`) to the
+    /// `Frida` logcat tag.
+    pub fn frida_log_lines(&self) -> Vec<String> {
+        let Ok(out) = self.adb(&["logcat", "-d", "-v", "raw", "-s", "Frida:V"]) else {
+            return Vec::new();
+        };
+        out.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("--------- beginning of"))
+            .map(ToOwned::to_owned)
+            .collect()
     }
 }
 

@@ -1,25 +1,61 @@
 //! Developer tool: runs a full Network capture session headlessly, for
 //! validating the emulator + proxy orchestration end-to-end.
 //!
-//! Usage: cargo run --example net_capture -- <app.apk|app.xapk> <AVD> [seconds]
+//! Usage: cargo run --example net_capture -- <app.apk|app.xapk> <AVD> [seconds] [--bypass] [--codeshare <owner/slug>] [--script <path_or_slug>]
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use bogusmips::net::bypass::ScriptSource;
 use bogusmips::net::controller::{NetworkController, StartConfig};
 use bogusmips::package::{Package, PackageKind};
 
 fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let bypass_checks = args.iter().any(|a| a == "--bypass" || a == "bypass");
-    args.retain(|a| a != "--bypass" && a != "bypass");
-    let mut args = args.into_iter();
-    let (Some(input), Some(avd)) = (args.next(), args.next()) else {
-        eprintln!("usage: net_capture <app.apk|xapk> <AVD> [seconds] [--bypass]");
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut bypass_checks = false;
+    let mut frida_scripts = Vec::new();
+    let mut positional = Vec::new();
+
+    let mut i = 0;
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+        if arg == "--bypass" || arg == "bypass" {
+            bypass_checks = true;
+        } else if let Some(val) = arg
+            .strip_prefix("--codeshare=")
+            .or_else(|| arg.strip_prefix("--script="))
+        {
+            let source = ScriptSource::parse(val).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2);
+            });
+            frida_scripts.push(source.spec());
+        } else if matches!(arg.as_str(), "--codeshare" | "-c" | "--script" | "-l") {
+            let Some(val) = raw_args.get(i + 1) else {
+                eprintln!("missing value after {arg}");
+                std::process::exit(2);
+            };
+            let source = ScriptSource::parse(val).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2);
+            });
+            frida_scripts.push(source.spec());
+            i += 1;
+        } else {
+            positional.push(arg.clone());
+        }
+        i += 1;
+    }
+
+    let mut positional = positional.into_iter();
+    let (Some(input), Some(avd)) = (positional.next(), positional.next()) else {
+        eprintln!(
+            "usage: net_capture <app.apk|xapk> <AVD> [seconds] [--bypass] [--codeshare <owner/slug>] [--script <path_or_slug>]"
+        );
         std::process::exit(2);
     };
-    let seconds: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(90);
+    let seconds: u64 = positional.next().and_then(|s| s.parse().ok()).unwrap_or(90);
     let path = PathBuf::from(&input);
     let pkg = Package::open(&path).expect("open package");
 
@@ -57,6 +93,7 @@ fn main() {
         apks,
         package: package_name,
         bypass_checks,
+        frida_scripts,
     });
 
     let deadline = Instant::now() + Duration::from_secs(seconds);

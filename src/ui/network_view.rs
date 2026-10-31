@@ -1,16 +1,19 @@
 //! Sidebar Network view: emulator controls, capture status and the live list
 //! of captured requests.
 
-use eframe::egui::{self, CornerRadius, RichText, ScrollArea, Sense, Stroke, vec2};
+use eframe::egui::{self, CornerRadius, Key, RichText, ScrollArea, Sense, Stroke, vec2};
 
 use super::icons::{self, Icon};
 use super::theme;
 use crate::inspect::group_digits;
+use crate::net::bypass::{FridaConfig, FridaScriptEntry, ScriptSource, parse_script_specs};
 use crate::net::capture::Scheme;
 use crate::net::controller::{NetworkController, Phase};
 use crate::net::emulator::Avd;
 
 const ROW_HEIGHT: f32 = 38.0;
+
+pub const FRIDA_SCRIPT_INPUT_ID: &str = "frida_script_input";
 
 #[derive(Default)]
 pub struct NetworkViewState {
@@ -18,6 +21,95 @@ pub struct NetworkViewState {
     pub filter: String,
     pub log_expanded: bool,
     pub bypass_checks: bool,
+    /// User-defined Frida scripts (CodeShare `owner/slug`, URL, or local `.js`
+    /// file path) with individual enable/disable checkboxes.
+    pub scripts: Vec<FridaScriptEntry>,
+    /// Current text in the "Add Frida script" input field.
+    pub script_input: String,
+    /// Validation error from the last attempt to add a script.
+    pub script_error: Option<String>,
+    /// Whether changes to Frida settings should be persisted to disk.
+    pub persist_config: bool,
+}
+
+impl NetworkViewState {
+    pub fn from_config(cfg: &FridaConfig, persist_config: bool) -> Self {
+        Self {
+            bypass_checks: cfg.bypass_checks,
+            scripts: cfg.scripts.clone(),
+            persist_config,
+            ..Self::default()
+        }
+    }
+
+    pub fn to_config(&self) -> FridaConfig {
+        FridaConfig {
+            bypass_checks: self.bypass_checks,
+            scripts: self.scripts.clone(),
+        }
+    }
+
+    fn save_if_enabled(&self) {
+        if self.persist_config {
+            let _ = self.to_config().save();
+        }
+    }
+
+    /// Parses and adds one or more Frida scripts (e.g. `"dzonerzy/aesinfo"`,
+    /// `"frida --codeshare dzonerzy/aesinfo"`, a URL, or a `.js` file path) and
+    /// enables them.
+    pub fn add_script(&mut self, raw: &str) -> Result<(), String> {
+        let parsed = match parse_script_specs(raw) {
+            Ok(list) => list,
+            Err(e) => {
+                self.script_error = Some(e.clone());
+                return Err(e);
+            }
+        };
+        for source in parsed {
+            let spec = source.spec();
+            if let Some(existing) = self.scripts.iter_mut().find(|s| s.spec == spec) {
+                existing.enabled = true;
+            } else {
+                self.scripts.push(FridaScriptEntry::new(spec, true));
+            }
+        }
+        self.script_error = None;
+        self.save_if_enabled();
+        Ok(())
+    }
+
+    /// Adds the script currently typed into [`Self::script_input`], clearing the
+    /// input field on success.
+    pub fn add_input_script(&mut self) -> bool {
+        let raw = self.script_input.trim().to_owned();
+        if raw.is_empty() {
+            return false;
+        }
+        if self.add_script(&raw).is_ok() {
+            self.script_input.clear();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Removes the script at `index`.
+    pub fn remove_script(&mut self, index: usize) {
+        if index < self.scripts.len() {
+            self.scripts.remove(index);
+            self.save_if_enabled();
+        }
+    }
+
+    /// Returns the specs of all currently enabled Frida scripts, in order.
+    pub fn enabled_scripts(&self) -> Vec<String> {
+        self.scripts
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.spec.clone())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +119,7 @@ pub enum NetworkAction {
     SelectFlow(u64),
     SaveCa,
     PickFile,
+    PickFridaScript,
 }
 
 fn status_color(status: Option<u16>) -> egui::Color32 {
@@ -109,7 +202,8 @@ pub fn show(
             ui.add_space(6.0);
 
             ui.add_enabled_ui(!running, |ui| {
-                ui.checkbox(&mut state.bypass_checks, "Bypass Play Services & root checks")
+                if ui
+                    .checkbox(&mut state.bypass_checks, "Bypass Play Services & root checks")
                     .on_hover_text(
                         "Inject a frida gadget that makes Google Play Services \
                          availability checks report success and neutralises common \
@@ -117,7 +211,16 @@ pub fn show(
                          that abort on a rooted/Play-Services-less emulator keep \
                          running. Downloads the gadget once (needs network and a \
                          rootable emulator). Cannot defeat server-side Play Integrity.",
-                    );
+                    )
+                    .changed()
+                {
+                    state.save_if_enabled();
+                }
+
+                ui.add_space(4.0);
+                if let Some(a) = frida_scripts_block(ui, state) {
+                    action = Some(a);
+                }
             });
             ui.add_space(6.0);
 
@@ -176,6 +279,116 @@ pub fn show(
     action
 }
 
+fn frida_scripts_block(ui: &mut egui::Ui, state: &mut NetworkViewState) -> Option<NetworkAction> {
+    let mut action = None;
+    let enabled_count = state.scripts.iter().filter(|s| s.enabled).count();
+    let header_text = if enabled_count > 0 {
+        format!("Frida scripts ({enabled_count} active)")
+    } else {
+        "Frida scripts".to_owned()
+    };
+    ui.label(RichText::new(header_text).size(11.5).color(theme::TEXT_DIM));
+    ui.add_space(2.0);
+
+    // Input row: text field (CodeShare slug, `frida --codeshare ...`, URL, or .js file) + Add + Browse.
+    let mut add_requested = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        let buttons_width = 66.0;
+        let input_width = (ui.available_width() - buttons_width).max(60.0);
+        let input_resp = egui::Frame::NONE
+            .fill(theme::INPUT)
+            .stroke(Stroke::new(1.0, theme::INPUT))
+            .corner_radius(2)
+            .inner_margin(egui::Margin {
+                left: 6,
+                right: 4,
+                top: 3,
+                bottom: 3,
+            })
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut state.script_input)
+                        .id(egui::Id::new(FRIDA_SCRIPT_INPUT_ID))
+                        .frame(false)
+                        .hint_text("dzonerzy/aesinfo or script.js")
+                        .desired_width(input_width - 10.0),
+                )
+            })
+            .inner
+            .on_hover_text(
+                "Add a Frida script by CodeShare slug (e.g. dzonerzy/aesinfo or \
+                 frida --codeshare dzonerzy/aesinfo), https:// URL, or local .js path.",
+            );
+
+        if input_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+            add_requested = true;
+        }
+        if ui
+            .add_enabled(
+                !state.script_input.trim().is_empty(),
+                egui::Button::new("Add").min_size(vec2(38.0, 22.0)),
+            )
+            .on_hover_text("Add Frida script")
+            .clicked()
+        {
+            add_requested = true;
+        }
+        if icons::button(ui, Icon::Files, 22.0, "Browse for a local Frida script (.js)…").clicked()
+        {
+            action = Some(NetworkAction::PickFridaScript);
+        }
+    });
+
+    if add_requested {
+        state.add_input_script();
+    }
+
+    if let Some(err) = &state.script_error {
+        ui.add(
+            egui::Label::new(RichText::new(err).size(11.0).color(theme::ERROR)).wrap(),
+        );
+    }
+
+    if !state.scripts.is_empty() {
+        ui.add_space(2.0);
+        let mut remove_idx = None;
+        let mut toggled = false;
+        ScrollArea::vertical()
+            .id_salt("frida_scripts")
+            .max_height(96.0)
+            .show(ui, |ui| {
+                for (idx, entry) in state.scripts.iter_mut().enumerate() {
+                    let tooltip = ScriptSource::parse(&entry.spec)
+                        .map(|s| s.description())
+                        .unwrap_or_else(|_| entry.spec.clone());
+                    ui.horizontal(|ui| {
+                        if ui
+                            .checkbox(&mut entry.enabled, &entry.spec)
+                            .on_hover_text(tooltip)
+                            .changed()
+                        {
+                            toggled = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if icons::button(ui, Icon::Close, 18.0, "Remove script").clicked() {
+                                remove_idx = Some(idx);
+                            }
+                        });
+                    });
+                }
+            });
+        if toggled {
+            state.save_if_enabled();
+        }
+        if let Some(idx) = remove_idx {
+            state.remove_script(idx);
+        }
+    }
+
+    action
+}
+
 fn status_block(
     ui: &mut egui::Ui,
     controller: &NetworkController,
@@ -205,7 +418,7 @@ fn status_block(
     if let Some(error) = &error {
         ui.add(egui::Label::new(RichText::new(error).size(12.0).color(theme::ERROR)).wrap());
     }
-    // A collapsible log of the last steps.
+    // A collapsible log of the session steps and Frida script output.
     if !log.is_empty() {
         let header = if state.log_expanded { "▾ Log" } else { "▸ Log" };
         if ui
@@ -220,12 +433,23 @@ fn status_block(
                 .corner_radius(3)
                 .inner_margin(egui::Margin::same(6))
                 .show(ui, |ui| {
-                    for line in log.iter().rev().take(8).rev() {
-                        ui.add(
-                            egui::Label::new(RichText::new(line).size(11.0).color(theme::TEXT_DIM))
-                                .wrap(),
-                        );
-                    }
+                    ScrollArea::vertical()
+                        .id_salt("net_log")
+                        .max_height(140.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            for line in &log {
+                                let color = if line.starts_with("[frida]") {
+                                    egui::Color32::from_rgb(0x9c, 0xdc, 0xfe)
+                                } else {
+                                    theme::TEXT_DIM
+                                };
+                                ui.add(
+                                    egui::Label::new(RichText::new(line).size(11.0).color(color))
+                                        .wrap(),
+                                );
+                            }
+                        });
                 });
         }
     }
