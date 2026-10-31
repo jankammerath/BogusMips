@@ -92,6 +92,33 @@ ensure_windows_cross_tools() {
             echo "==> Installing cargo-xwin..."
             cargo install --locked cargo-xwin
         fi
+
+        # Crates like `ring` force `clang` (GNU driver mode) instead of `clang-cl` on
+        # `aarch64-pc-windows-msvc`, while `cargo-xwin` populates `CFLAGS` with `/imsvc <dir>`.
+        # Provide a thin `clang` shim that rewrites `/imsvc` / `-imsvc` to `-isystem`.
+        local real_clang
+        real_clang="$(command -v clang)"
+        mkdir -p "${STAGE_DIR}/bin"
+        cat > "${STAGE_DIR}/bin/clang" <<EOF
+#!/usr/bin/env bash
+args=()
+for arg in "\$@"; do
+    case "\$arg" in
+        /imsvc|-imsvc)
+            args+=("-isystem")
+            ;;
+        /imsvc*|-imsvc*)
+            args+=("-isystem" "\${arg#?imsvc}")
+            ;;
+        *)
+            args+=("\$arg")
+            ;;
+    esac
+done
+exec "${real_clang}" "\${args[@]}"
+EOF
+        chmod +x "${STAGE_DIR}/bin/clang"
+        export PATH="${STAGE_DIR}/bin:$PATH"
     fi
 }
 
