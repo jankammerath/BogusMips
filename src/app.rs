@@ -4,19 +4,22 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers, RichText};
 
+use crate::agent::{AgentContext, AgentController};
 use crate::export::{self, ExportKind};
 use crate::inspect::{Content, Inspection, format_size, group_digits, inspect};
 use crate::package::{NodeId, Package, PackageKind};
 use crate::net::controller::{NetworkController, StartConfig};
 use crate::net::emulator::Avd;
 use crate::search::SearchController;
+use crate::ui::agent_panel::{self, AgentPanelAction, AgentPanelState, ContextSummary};
 use crate::ui::content_view::{self, Goto, ViewMode};
 use crate::ui::icons::{self, Icon};
+use crate::ui::info_panel::{self, RightTab};
 use crate::ui::net_detail::{self, FlowDetailState};
 use crate::ui::network_view::{self, NetworkAction, NetworkViewState};
 use crate::ui::search_view::{self, SearchAction, SearchViewState};
 use crate::ui::tree_view::{self, TreeState};
-use crate::ui::{MenuAction, info_panel, theme};
+use crate::ui::{MenuAction, theme};
 
 const OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 const CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
@@ -29,6 +32,8 @@ const SHOW_SEARCH: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::F);
 const SHOW_NETWORK: KeyboardShortcut =
     KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::N);
+const SHOW_AGENT: KeyboardShortcut =
+    KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::A);
 const ACTIVITY_BAR_WIDTH: f32 = 48.0;
 
 /// The views of the left sidebar, selected in the activity bar.
@@ -115,6 +120,9 @@ pub struct BogusMipsApp {
     notice: Option<String>,
     save_dialog: SaveDialog,
     show_info: bool,
+    right_tab: RightTab,
+    agent: AgentController,
+    agent_view: AgentPanelState,
     show_sidebar: bool,
     sidebar_view: SideView,
     /// Where the activity bar icons were drawn (for tests).
@@ -177,6 +185,11 @@ impl BogusMipsApp {
             MenuAction::ShowExplorer => self.show_view(ctx, SideView::Explorer),
             MenuAction::ShowSearch => self.show_view(ctx, SideView::Search),
             MenuAction::ShowNetwork => self.show_view(ctx, SideView::Network),
+            MenuAction::ShowAgent => {
+                self.show_info = true;
+                self.right_tab = RightTab::Agent;
+                ctx.memory_mut(|m| m.request_focus(egui::Id::new(agent_panel::PROMPT_INPUT_ID)));
+            }
             MenuAction::ToggleInfo => self.show_info = !self.show_info,
         }
     }
@@ -194,6 +207,9 @@ impl BogusMipsApp {
             notice: None,
             save_dialog: Box::new(native_save_dialog),
             show_info: true,
+            right_tab: RightTab::default(),
+            agent: AgentController::new(),
+            agent_view: AgentPanelState::default(),
             show_sidebar: true,
             sidebar_view: SideView::Explorer,
             activity_icons: Vec::new(),
@@ -398,11 +414,12 @@ impl BogusMipsApp {
 
     fn handle_input(&mut self, ctx: &egui::Context) {
         // Shift variants first: shortcuts without Shift also match with it.
-        let (show_explorer, show_search, show_network) = ctx.input_mut(|i| {
+        let (show_explorer, show_search, show_network, show_agent) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&SHOW_EXPLORER),
                 i.consume_shortcut(&SHOW_SEARCH),
                 i.consume_shortcut(&SHOW_NETWORK),
+                i.consume_shortcut(&SHOW_AGENT),
             )
         });
         if show_explorer {
@@ -413,6 +430,9 @@ impl BogusMipsApp {
         }
         if show_network {
             self.show_view(ctx, SideView::Network);
+        }
+        if show_agent {
+            self.perform(ctx, MenuAction::ShowAgent);
         }
         let (open, close, toggle_info, find, export, dropped) = ctx.input_mut(|i| {
             (
@@ -500,6 +520,13 @@ impl BogusMipsApp {
                 MenuAction::ShowNetwork,
             );
             ui.separator();
+            entry(
+                ui,
+                "AI Agent",
+                true,
+                Some(&SHOW_AGENT),
+                MenuAction::ShowAgent,
+            );
             entry(
                 ui,
                 info_label,
@@ -631,18 +658,69 @@ impl BogusMipsApp {
             },
             None => ("File information", None),
         };
-        let mut close = false;
+        let selected_label = self
+            .document
+            .as_ref()
+            .and_then(|d| d.selected.map(|n| d.package.nodes[n].label.clone()));
+        let flow_count = self
+            .document
+            .as_ref()
+            .map_or(0, |d| d.net.capture().len());
+        let selected_flow = self.document.as_ref().and_then(|d| d.selected_flow);
+
+        let mut response = info_panel::RightPanelResponse {
+            close: false,
+            agent_action: None,
+        };
         egui::SidePanel::right("info_panel")
             .resizable(true)
-            .default_width(300.0)
-            .min_width(220.0)
+            .default_width(320.0)
+            .min_width(240.0)
             .show_separator_line(false)
             .frame(theme::card(theme::SIDEBAR))
             .show(ctx, |ui| {
-                close = info_panel::show(ui, title, sections.as_deref());
+                let summary = ContextSummary {
+                    has_package: self.document.is_some(),
+                    selected_label: selected_label.as_deref(),
+                    flow_count,
+                    selected_flow,
+                };
+                response = info_panel::show_right_panel(
+                    ui,
+                    &mut self.right_tab,
+                    title,
+                    sections.as_deref(),
+                    &mut self.agent,
+                    &mut self.agent_view,
+                    &summary,
+                );
             });
-        if close {
+        if response.close {
             self.show_info = false;
+        }
+        match response.agent_action {
+            Some(AgentPanelAction::SendPrompt(prompt)) => {
+                let workspace_ctx = AgentContext::from_config(
+                    &self.agent.config,
+                    self.document.as_ref().map(|d| d.package.clone()),
+                    self.document.as_ref().and_then(|d| d.selected),
+                    self.document.as_ref().map(|d| d.net.capture().clone()),
+                    self.document.as_ref().and_then(|d| d.selected_flow),
+                );
+                self.agent.send(prompt, workspace_ctx, ctx);
+            }
+            Some(AgentPanelAction::SelectNode(node)) => {
+                if let Some(doc) = &mut self.document {
+                    select(ctx, doc, node);
+                }
+            }
+            Some(AgentPanelAction::SelectFlow(id)) => {
+                if let Some(doc) = &mut self.document {
+                    doc.selected_flow = Some(id);
+                    doc.flow_detail = FlowDetailState::default();
+                }
+            }
+            None => {}
         }
     }
 
@@ -1025,6 +1103,7 @@ impl BogusMipsApp {
             self.start_loading(ctx, path);
         }
         self.poll_loading(ctx);
+        self.agent.poll();
         if let Some(doc) = &mut self.document {
             doc.search.poll(&doc.package, ctx);
             if doc.net.is_running() {
@@ -1038,7 +1117,7 @@ impl BogusMipsApp {
         self.menu_bar(ctx);
         self.status_bar(ctx);
         self.sidebar(ctx);
-        if self.document.is_some() && self.show_info {
+        if self.show_info {
             self.info_panel(ctx);
         }
         self.editor(ctx);
@@ -1655,6 +1734,98 @@ mod tests {
         assert!(texts.iter().any(|(_, t)| t == "https://api.example/v1/items"), "{texts:?}");
         assert!(texts.iter().any(|(_, t)| t == "Overview"));
         assert!(texts.iter().any(|(_, t)| t == "Response"));
+    }
+
+    #[test]
+    fn agent_panel_in_right_sidebar_queries_code_resources_and_traffic() {
+        use crate::agent::{AgentConfig, HttpTransport, Provider};
+        use std::sync::Mutex;
+
+        struct CannedTransport(Mutex<Vec<(u16, String)>>);
+        impl HttpTransport for CannedTransport {
+            fn post_json(
+                &self,
+                _url: &str,
+                _headers: &[(&str, &str)],
+                _body: &str,
+            ) -> Result<(u16, String), String> {
+                Ok(self.0.lock().unwrap().remove(0))
+            }
+        }
+
+        let zip = crate::formats::zip::write_stored_zip(&[(
+            "assets/endpoint.json",
+            br#"{"endpoint":"https://api.example/v1/items"}"#,
+        )]);
+        let package = Package::from_bytes(Path::new("test.apk"), zip.into()).unwrap();
+        let endpoint_node = node_named(&package, "endpoint.json");
+
+        let ctx = egui::Context::default();
+        let mut app = BogusMipsApp::with_context(&ctx, None);
+        let mut cfg = AgentConfig::default();
+        cfg.provider = Provider::Claude;
+        cfg.settings_mut(Provider::Claude).api_key = "sk-ant-test".to_owned();
+        let transport = Arc::new(CannedTransport(Mutex::new(vec![
+            (
+                200,
+                r#"{"content":[{"type":"tool_use","id":"tu_1","name":"read_node","input":{"target":"endpoint.json"}}]}"#.to_owned(),
+            ),
+            (
+                200,
+                r#"{"content":[{"type":"text","text":"The endpoint is https://api.example/v1/items."}]}"#.to_owned(),
+            ),
+        ])));
+        app.agent = AgentController::with_transport(cfg, transport);
+        app.document = Some(Document::new(package));
+
+        // The AI Agent panel is rendered in the right sidebar (> 900px x coordinate).
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        let (agent_tab_pos, _) = texts
+            .iter()
+            .find(|(_, t)| t == "AI Agent")
+            .expect("AI Agent tab drawn");
+        assert!(agent_tab_pos.x > 900.0, "expected in right sidebar: {agent_tab_pos:?}");
+
+        // Focus prompt input via ⇧⌘A, type a question, and press Enter.
+        app.perform(&ctx, MenuAction::ShowAgent);
+        let _ = ctx.run(
+            input(vec![egui::Event::Text("Where is the endpoint configured?".into())]),
+            |ctx| app.ui(ctx),
+        );
+        assert_eq!(app.agent_view.prompt, "Where is the endpoint configured?");
+        let _ = ctx.run(
+            input(vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }]),
+            |ctx| app.ui(ctx),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.agent.messages.len() < 2 && Instant::now() < deadline {
+            frame(&ctx, &mut app);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.agent.messages.len(), 2);
+        assert!(
+            app.agent.messages[1]
+                .text
+                .contains("https://api.example/v1/items")
+        );
+
+        // Clicking the tool trace in the right sidebar opens the inspected file in the editor.
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        let (trace_pos, _) = texts
+            .iter()
+            .find(|(_, t)| t.contains("Read endpoint.json"))
+            .expect("tool trace drawn");
+        let _ = ctx.run(input(click(*trace_pos + egui::vec2(8.0, 4.0))), |ctx| {
+            app.ui(ctx)
+        });
+        assert_eq!(app.document.as_ref().unwrap().selected, Some(endpoint_node));
     }
 
     fn node_named(package: &Package, label: &str) -> NodeId {

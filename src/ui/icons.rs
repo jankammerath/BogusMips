@@ -15,6 +15,9 @@ pub enum Icon {
     Lock,
     Trash,
     Download,
+    Agent,
+    Settings,
+    Send,
 }
 
 fn line(painter: &Painter, points: Vec<Pos2>, stroke: Stroke) {
@@ -140,6 +143,42 @@ pub fn paint(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             line(painter, vec![p(8.0, 2.0), p(8.0, 10.5)], stroke);
             line(painter, vec![p(4.0, 7.0), p(8.0, 10.5), p(12.0, 7.0)], stroke);
             line(painter, vec![p(2.5, 13.5), p(13.5, 13.5)], stroke);
+        }
+        Icon::Agent => {
+            // Sparkle star.
+            line(
+                painter,
+                vec![
+                    p(8.0, 1.5),
+                    p(9.6, 6.4),
+                    p(14.5, 8.0),
+                    p(9.6, 9.6),
+                    p(8.0, 14.5),
+                    p(6.4, 9.6),
+                    p(1.5, 8.0),
+                    p(6.4, 6.4),
+                    p(8.0, 1.5),
+                ],
+                stroke,
+            );
+        }
+        Icon::Settings => {
+            // Three horizontal sliders.
+            line(painter, vec![p(2.0, 4.0), p(14.0, 4.0)], stroke);
+            painter.circle_filled(p(5.5, 4.0), 1.6 * s, color);
+            line(painter, vec![p(2.0, 8.0), p(14.0, 8.0)], stroke);
+            painter.circle_filled(p(10.5, 8.0), 1.6 * s, color);
+            line(painter, vec![p(2.0, 12.0), p(14.0, 12.0)], stroke);
+            painter.circle_filled(p(7.0, 12.0), 1.6 * s, color);
+        }
+        Icon::Send => {
+            // Right-pointing paper plane / arrow.
+            line(
+                painter,
+                vec![p(2.0, 3.0), p(14.0, 8.0), p(2.0, 13.0), p(4.5, 8.0), p(2.0, 3.0)],
+                stroke,
+            );
+            line(painter, vec![p(4.5, 8.0), p(10.0, 8.0)], stroke);
         }
     }
 }

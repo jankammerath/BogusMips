@@ -1,5 +1,6 @@
 //! BogusMips: analyze how far an Android app can be disassembled.
 
+pub mod agent;
 pub mod app;
 pub mod beautify;
 pub mod export;

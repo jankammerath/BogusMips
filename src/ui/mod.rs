@@ -1,3 +1,4 @@
+pub mod agent_panel;
 pub mod content_view;
 pub mod highlight;
 pub mod icon;
@@ -21,5 +22,6 @@ pub enum MenuAction {
     ShowExplorer,
     ShowSearch,
     ShowNetwork,
+    ShowAgent,
     ToggleInfo,
 }

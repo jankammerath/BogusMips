@@ -24,7 +24,9 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
   - Images are previewed, text is shown as text, and everything else as a hex dump.
   - Minified JSON, JavaScript (incl. React Native bundles), CSS, HTML and XML are beautified automatically, with syntax highlighting. Only whitespace is changed; **Original** shows the file as stored.
   - A hex view is available for any file.
-- **Right: collapsible file information** (⌘I): size, compression, CRC, SHA-256, DEX header details, class details, manifest summary, permissions, and any anomalies found.
+- **Right: AI Agent (⇧⌘A) and collapsible file information (⌘I)**:
+  - **AI Agent**: prompt an AI agent about the disassembled smali source code, decoded resource files (`AndroidManifest.xml`, `resources.arsc` values), and captured HTTP/HTTPS network traffic. Configurable with **Grok (xAI)**, **Gemini (Google)**, **Claude (Anthropic)**, **OpenAI (ChatGPT)**, or any custom OpenAI-compatible endpoint (e.g. Ollama, OpenRouter). The agent has built-in tools (`search_package`, `list_nodes`, `read_node`, `list_network_flows`, `inspect_network_flow`) to autonomously search and read classes, resources, and captured network flows.
+  - **File / Request information**: size, compression, CRC, SHA-256, DEX header details, class details, manifest summary, permissions, and any anomalies found.
 
 ### Network
 
@@ -94,6 +96,12 @@ src/
 ├── app.rs               # application state, menus, panels, background loading
 ├── inspect.rs           # turns a tree node into content + file information
 ├── search.rs            # content search: background index, regex search
+├── agent/               # AI agent: multi-provider LLM client + package/network tools
+│   ├── mod.rs           # background agent controller and chat state
+│   ├── config.rs        # provider settings (Grok, Gemini, Claude, OpenAI, Custom)
+│   ├── client.rs        # HTTPS client + tool-calling loops per provider API
+│   ├── tools.rs         # context builder and tools over source, resources, and traffic
+│   └── json.rs          # self-contained JSON parser and serializer
 ├── net/                 # Network view: emulator control + MITM proxy
 │   ├── mod.rs
 │   ├── ca.rs            # proxy CA + per-host leaf certificates (rcgen)
@@ -126,7 +134,8 @@ src/
     ├── theme.rs         # dark theme (egui widgets + native window frame)
     ├── tree_view.rs     # left panel
     ├── content_view.rs  # center panel (text, hex, image)
-    ├── info_panel.rs    # right panel
+    ├── info_panel.rs    # right panel (AI Agent + File/Request info tabs)
+    ├── agent_panel.rs   # AI Agent prompt window and provider configuration UI
     ├── search_view.rs   # sidebar search view
     ├── network_view.rs  # sidebar network view (request list, AVD controls)
     ├── net_detail.rs    # editor view for a captured request/response
