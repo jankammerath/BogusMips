@@ -4,6 +4,22 @@
 
 BogusMips is written in Rust and allows performing analyses on how far your Android app can be disassembled. It allows you to open the `*.apk` or `*.xapk` file of your app to see how far your app can be disassembled. 
 
+<p align="center">
+  <a href="https://github.com/jankammerath/BogusMips/releases/latest/download/BogusMips-Windows-x64.zip">
+    <img src="https://img.shields.io/badge/Download-BogusMips%20for%20Windows%20(x64)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download BogusMips for Windows x64" height="48">
+  </a>
+  &nbsp;
+  <a href="https://github.com/jankammerath/BogusMips/releases/latest/download/BogusMips-Windows-Arm64.zip">
+    <img src="https://img.shields.io/badge/Download-BogusMips%20for%20Windows%20(ARM64)-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download BogusMips for Windows ARM64" height="48">
+  </a>
+  &nbsp;
+  <a href="https://github.com/jankammerath/BogusMips/releases/latest/download/BogusMips-macOS.dmg">
+    <img src="https://img.shields.io/badge/Download-BogusMips%20for%20macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download BogusMips for macOS" height="48">
+  </a>
+  <br><br>
+  <sub><a href="https://github.com/jankammerath/BogusMips/releases">All releases and changelogs</a></sub>
+</p>
+
 ![Source Code and Resources extracted with BogusMips Disassembler](/screenshots/screenshot1.png)
 
 ## Features
