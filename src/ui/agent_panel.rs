@@ -2,15 +2,13 @@
 //! Claude, OpenAI, Custom), conversation history, tool traces, and prompt box.
 
 use eframe::egui::{
-    self, Color32, CornerRadius, Key, Margin, RichText, ScrollArea, Sense, Stroke, TextStyle,
-    text::LayoutJob, vec2,
+    self, Color32, CornerRadius, Key, Margin, RichText, ScrollArea, Sense, Stroke, vec2,
 };
 
-use super::highlight::{self, highlight_into};
 use super::icons::{self, Icon};
+use super::markdown;
 use super::theme;
 use crate::agent::{AgentController, ChatMessage, Provider, Role, ToolTarget, ToolTrace};
-use crate::inspect::Syntax;
 use crate::package::NodeId;
 
 pub const PROMPT_INPUT_ID: &str = "agent_prompt_input";
@@ -548,7 +546,8 @@ fn render_message(
                         );
                     });
             } else {
-                render_formatted_text(ui, index, &msg.text);
+                ui.add_space(2.0);
+                markdown::show(ui, index, &msg.text);
             }
         }
     }
@@ -581,82 +580,6 @@ fn render_trace_pill(ui: &mut egui::Ui, trace: &ToolTrace) -> Option<AgentPanelA
         }
     }
     None
-}
-
-fn syntax_for_tag(tag: &str) -> Syntax {
-    match tag.trim().to_ascii_lowercase().as_str() {
-        "smali" | "dalvik" => Syntax::Smali,
-        "xml" | "html" | "axml" => Syntax::Xml,
-        "json" => Syntax::Json,
-        "js" | "javascript" | "ts" | "java" | "kotlin" => Syntax::JavaScript,
-        "css" => Syntax::Css,
-        _ => Syntax::Plain,
-    }
-}
-
-fn render_formatted_text(ui: &mut egui::Ui, msg_idx: usize, text: &str) {
-    let mut in_code = false;
-    let mut code_lang = String::new();
-    let mut code_buf = String::new();
-    let mut block_idx = 0usize;
-
-    for line in text.lines() {
-        if let Some(rest) = line.trim_start().strip_prefix("```") {
-            if in_code {
-                render_code_block(ui, (msg_idx, block_idx), &code_lang, &code_buf);
-                code_buf.clear();
-                code_lang.clear();
-                in_code = false;
-                block_idx += 1;
-            } else {
-                code_lang = rest.trim().to_owned();
-                in_code = true;
-            }
-            continue;
-        }
-        if in_code {
-            if !code_buf.is_empty() {
-                code_buf.push('\n');
-            }
-            code_buf.push_str(line);
-        } else if line.trim().is_empty() {
-            ui.add_space(4.0);
-        } else {
-            ui.add(
-                egui::Label::new(RichText::new(line).color(theme::TEXT).size(12.5))
-                    .wrap()
-                    .selectable(true),
-            );
-        }
-    }
-    if in_code && !code_buf.is_empty() {
-        render_code_block(ui, (msg_idx, block_idx), &code_lang, &code_buf);
-    }
-}
-
-fn render_code_block(ui: &mut egui::Ui, id: (usize, usize), lang: &str, code: &str) {
-    let syntax = syntax_for_tag(lang);
-    let mono = TextStyle::Monospace.resolve(ui.style());
-    egui::Frame::NONE
-        .fill(theme::EDITOR)
-        .stroke(Stroke::new(1.0, theme::CARD_BORDER))
-        .corner_radius(CornerRadius::same(4))
-        .inner_margin(Margin::symmetric(8, 6))
-        .show(ui, |ui| {
-            ui.set_max_width(ui.available_width());
-            ScrollArea::horizontal()
-                .id_salt(("agent_code", id.0, id.1))
-                .show(ui, |ui| {
-                    let mut job = LayoutJob::default();
-                    for (i, line) in code.lines().enumerate() {
-                        if i > 0 {
-                            highlight::append(&mut job, "\n", theme::TEXT, &mono);
-                        }
-                        highlight_into(&mut job, line, syntax, &mono);
-                    }
-                    ui.add(egui::Label::new(job).extend().selectable(true));
-                });
-        });
 }
 
 fn prompt_box(

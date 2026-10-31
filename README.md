@@ -136,6 +136,7 @@ src/
     ├── content_view.rs  # center panel (text, hex, image)
     ├── info_panel.rs    # right panel (AI Agent + File/Request info tabs)
     ├── agent_panel.rs   # AI Agent prompt window and provider configuration UI
+    ├── markdown.rs      # Markdown parser and renderer for agent responses
     ├── search_view.rs   # sidebar search view
     ├── network_view.rs  # sidebar network view (request list, AVD controls)
     ├── net_detail.rs    # editor view for a captured request/response

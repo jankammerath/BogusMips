@@ -4,6 +4,7 @@ pub mod highlight;
 pub mod icon;
 pub mod icons;
 pub mod info_panel;
+pub mod markdown;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub mod native_menu;
 pub mod net_detail;
