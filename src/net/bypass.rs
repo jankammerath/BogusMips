@@ -53,6 +53,13 @@ pub fn gadget_url(version: &str, abi: &str) -> String {
     )
 }
 
+/// GitHub release URL of the standalone `frida-inject` binary `.xz` for `abi`.
+pub fn inject_url(version: &str, abi: &str) -> String {
+    format!(
+        "https://github.com/frida/frida/releases/download/{version}/frida-inject-{version}-android-{abi}.xz"
+    )
+}
+
 /// Directory where downloaded gadgets are cached between sessions.
 pub fn cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_CACHE_HOME") {
@@ -86,6 +93,32 @@ pub fn ensure_gadget(cache_dir: &Path, abi: &str) -> Result<PathBuf, String> {
     // Sanity check: the gadget is an ELF shared library.
     if out.get(..4) != Some(ELF_MAGIC) {
         return Err("the downloaded frida gadget is not a valid library".into());
+    }
+    std::fs::write(&dest, &out).map_err(|e| e.to_string())?;
+    Ok(dest)
+}
+
+/// Ensures the decompressed standalone `frida-inject` binary for `abi` exists
+/// in `cache_dir`, downloading and decompressing it on first use.
+pub fn ensure_inject(cache_dir: &Path, abi: &str) -> Result<PathBuf, String> {
+    let version = frida_version();
+    let dest = cache_dir.join(format!("frida-inject-{version}-android-{abi}"));
+    if dest.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+
+    let url = inject_url(&version, abi);
+    let compressed = cache_dir.join(format!("frida-inject-{version}-android-{abi}.xz"));
+    download(&url, &compressed)?;
+
+    let bytes = std::fs::read(&compressed).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    lzma_rs::xz_decompress(&mut std::io::Cursor::new(bytes), &mut out)
+        .map_err(|e| format!("could not decompress frida-inject: {e}"))?;
+    let _ = std::fs::remove_file(&compressed);
+    if out.get(..4) != Some(ELF_MAGIC) {
+        return Err("the downloaded frida-inject binary is not a valid ELF executable".into());
     }
     std::fs::write(&dest, &out).map_err(|e| e.to_string())?;
     Ok(dest)
@@ -477,8 +510,61 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
 
     let mut out = String::from(
         r#"(function () {
+  function safeSet(obj, prop, val) {
+    if (!obj) return false;
+    try {
+      obj[prop] = val;
+      if (obj[prop] === val) return true;
+    } catch (e) {}
+    try {
+      Object.defineProperty(obj, prop, {
+        value: val,
+        writable: true,
+        configurable: true,
+        enumerable: true
+      });
+      return obj[prop] === val;
+    } catch (e) {}
+    return false;
+  }
+
+  function makeDelegate(target, overrides) {
+    if (!target) return overrides;
+    var allSucceeded = true;
+    for (var k in overrides) {
+      if (Object.prototype.hasOwnProperty.call(overrides, k)) {
+        if (!safeSet(target, k, overrides[k])) {
+          allSucceeded = false;
+        }
+      }
+    }
+    if (allSucceeded) return target;
+    if (typeof Proxy === 'function') {
+      try {
+        return new Proxy({}, {
+          get: function (_dummy, prop) {
+            if (Object.prototype.hasOwnProperty.call(overrides, prop)) {
+              return overrides[prop];
+            }
+            var v = target[prop];
+            return (typeof v === 'function') ? v.bind(target) : v;
+          },
+          set: function (_dummy, prop, val) {
+            overrides[prop] = val;
+            safeSet(target, prop, val);
+            return true;
+          },
+          has: function (_dummy, prop) {
+            return (prop in overrides) || (prop in target);
+          }
+        });
+      } catch (e) {}
+    }
+    return target;
+  }
+
   if (typeof globalThis.__bogusmipsWrapped !== 'undefined') return;
-  globalThis.__bogusmipsWrapped = true;
+  safeSet(globalThis, '__bogusmipsWrapped', true);
   var origSetTimeout = globalThis.setTimeout;
   var origSetImmediate = globalThis.setImmediate;
   var FridaFile = (typeof File === 'function') ? File : null;
@@ -537,53 +623,59 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     return parts.join(' ');
   }
 
-  var origConsoleLog = console.log ? console.log.bind(console) : function () {};
-  var origConsoleWarn = console.warn ? console.warn.bind(console) : origConsoleLog;
-  var origConsoleError = console.error ? console.error.bind(console) : origConsoleLog;
-  console.log = function () {
-    writeOutput(formatArgs(arguments));
-    try { origConsoleLog.apply(console, arguments); } catch (e) {}
-  };
-  console.warn = function () {
-    writeOutput(formatArgs(arguments));
-    try { origConsoleWarn.apply(console, arguments); } catch (e) {}
-  };
-  console.error = function () {
-    writeOutput(formatArgs(arguments));
-    try { origConsoleError.apply(console, arguments); } catch (e) {}
-  };
-  if (typeof send === 'function') {
-    var origSend = send;
-    globalThis.send = function (message, data) {
-      try {
-        var text = (typeof message === 'string') ? message : JSON.stringify(message);
-        writeOutput(text);
-      } catch (e) {}
+  var origConsoleLog = (typeof console !== 'undefined' && console.log) ? console.log.bind(console) : function () {};
+  var origConsoleWarn = (typeof console !== 'undefined' && console.warn) ? console.warn.bind(console) : origConsoleLog;
+  var origConsoleError = (typeof console !== 'undefined' && console.error) ? console.error.bind(console) : origConsoleLog;
+  var bogusmipsConsole = makeDelegate(typeof console !== 'undefined' ? console : {}, {
+    log: function () {
+      writeOutput(formatArgs(arguments));
+      try { origConsoleLog.apply(console, arguments); } catch (e) {}
+    },
+    warn: function () {
+      writeOutput(formatArgs(arguments));
+      try { origConsoleWarn.apply(console, arguments); } catch (e) {}
+    },
+    error: function () {
+      writeOutput(formatArgs(arguments));
+      try { origConsoleError.apply(console, arguments); } catch (e) {}
+    }
+  });
+  var origSend = (typeof globalThis.send === 'function') ? globalThis.send : null;
+  var bogusmipsSend = function (message, data) {
+    try {
+      var text = (typeof message === 'string') ? message : JSON.stringify(message);
+      writeOutput(text);
+    } catch (e) {}
+    if (origSend) {
       try { return origSend(message, data); } catch (e) {}
-    };
-  }
+    }
+  };
+  safeSet(globalThis, 'send', bogusmipsSend);
 
   writeOutput('[bogusmips:gadget:loaded]');
 
   // 2. Polyfill Frida 12 Memory.* helpers used by older CodeShare scripts
   //    (e.g. fdciabdul/frida-multiple-bypass).
+  var bogusmipsMemory = (typeof Memory !== 'undefined') ? Memory : {};
   if (typeof Memory !== 'undefined') {
+    var memOverrides = {};
     if (typeof Memory.readCString !== 'function') {
-      Memory.readCString = function (p) {
+      memOverrides.readCString = function (p) {
         try { return ptr(p).readCString(); } catch (e) { return ''; }
       };
     }
     if (typeof Memory.readUtf8String !== 'function') {
-      Memory.readUtf8String = function (p) {
+      memOverrides.readUtf8String = function (p) {
         try { return ptr(p).readUtf8String(); } catch (e) { return ''; }
       };
     }
     if (typeof Memory.writeUtf8String !== 'function') {
-      Memory.writeUtf8String = function (p, _s) {
+      memOverrides.writeUtf8String = function (p, _s) {
         // Never overwrite caller string literals in-place (.rodata -> SIGSEGV).
         return p;
       };
     }
+    bogusmipsMemory = makeDelegate(Memory, memOverrides);
   }
 
   // 3. Guard Module.findExportByName & Interceptor.attach against hooking
@@ -595,35 +687,41 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     'access': true, 'faccessat': true, 'stat': true, 'lstat': true, 'fstat': true,
     '__system_property_get': true, '__system_property_read': true, 'system': true
   };
+  var bogusmipsModule = (typeof Module !== 'undefined') ? Module : {};
   if (origFindExport) {
-    Module.findExportByName = function (moduleName, exportName) {
-      var addr = origFindExport(moduleName, exportName);
-      try {
-        var mod = moduleName ? ('' + moduleName).toLowerCase() : '';
-        var sym = '' + exportName;
-        if ((mod === '' || mod.indexOf('libc.so') !== -1) && unsafeLibcSymbols[sym] && addr) {
-          unsafeNativeAddrs[addr.toString()] = sym;
-        }
-      } catch (e) {}
-      return addr;
-    };
+    bogusmipsModule = makeDelegate(Module, {
+      findExportByName: function (moduleName, exportName) {
+        var addr = origFindExport(moduleName, exportName);
+        try {
+          var mod = moduleName ? ('' + moduleName).toLowerCase() : '';
+          var sym = '' + exportName;
+          if ((mod === '' || mod.indexOf('libc.so') !== -1) && unsafeLibcSymbols[sym] && addr) {
+            unsafeNativeAddrs[addr.toString()] = sym;
+          }
+        } catch (e) {}
+        return addr;
+      }
+    });
   }
+  var bogusmipsInterceptor = (typeof Interceptor !== 'undefined') ? Interceptor : {};
   if (typeof Interceptor !== 'undefined' && typeof Interceptor.attach === 'function') {
     var origAttach = Interceptor.attach.bind(Interceptor);
     var attachedAddrs = {};
-    Interceptor.attach = function (target, callbacksOrProbe, data) {
-      try {
-        if (!target) return { detach: function () {} };
-        var key = target.toString();
-        if (key === '0x0' || key === '0' || unsafeNativeAddrs[key] || attachedAddrs[key]) {
+    bogusmipsInterceptor = makeDelegate(Interceptor, {
+      attach: function (target, callbacksOrProbe, data) {
+        try {
+          if (!target) return { detach: function () {} };
+          var key = target.toString();
+          if (key === '0x0' || key === '0' || unsafeNativeAddrs[key] || attachedAddrs[key]) {
+            return { detach: function () {} };
+          }
+          attachedAddrs[key] = true;
+          return origAttach(target, callbacksOrProbe, data);
+        } catch (e) {
           return { detach: function () {} };
         }
-        attachedAddrs[key] = true;
-        return origAttach(target, callbacksOrProbe, data);
-      } catch (e) {
-        return { detach: function () {} };
       }
-    };
+    });
   }
 
   // 4. Do NOT touch `Java` at t = 0ms (during LD_PRELOAD, before ART is
@@ -632,15 +730,19 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
   var shimsInstalled = false;
   var origPerform = null;
   var origUse = null;
+  var bogusmipsJava = null;
+  var bogusmipsSetTimeout = origSetTimeout;
+  var bogusmipsSetImmediate = origSetImmediate;
   var envHooked = {};
 
   function applyBaselineEnvHooks() {
     if (!origUse) return;
+    var useFn = (bogusmipsJava && bogusmipsJava.use) ? bogusmipsJava.use : origUse;
     function hookReturn(className, method, value) {
       var key = className + '#' + method;
       if (envHooked[key]) return;
       try {
-        var cls = Java.use(className);
+        var cls = useFn(className);
         if (!cls || !cls[method]) return;
         cls[method].overloads.forEach(function (ov) {
           ov.implementation = function () { return value; };
@@ -666,6 +768,63 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     hookReturn('com.scottyab.rootbeer.RootBeerNative', 'checkForRoot', 0);
     hookReturn('com.scottyab.rootbeer.RootBeerNative', 'isLibraryLoaded', false);
 
+    // Spoof Google Play Store installer origin & bypass Google Play PairIP license checks.
+    hookReturn('android.app.ApplicationPackageManager', 'getInstallerPackageName', 'com.android.vending');
+    ['getInstallingPackageName', 'getInitiatingPackageName', 'getOriginatingPackageName'].forEach(function (m) {
+      hookReturn('android.content.pm.InstallSourceInfo', m, 'com.android.vending');
+    });
+    ['initializeLicenseCheck', 'connectToLicensingService', 'startErrorDialogActivity', 'handleError'].forEach(function (m) {
+      hookReturn('com.pairip.licensecheck.LicenseClient', m, undefined);
+      hookReturn('com.pairip.licensecheck3.LicenseClient', m, undefined);
+    });
+    ['com.pairip.licensecheck.LicenseActivity', 'com.pairip.licensecheck3.LicenseActivity'].forEach(function (c) {
+      var key = c + '#onCreate';
+      if (!envHooked[key]) {
+        try {
+          var actCls = origUse(c);
+          if (actCls && actCls.onCreate) {
+            actCls.onCreate.overloads.forEach(function (ov) {
+              ov.implementation = function (b) {
+                try { this.onCreate(b); } catch (e) {}
+                try { this.finish(); } catch (e) {}
+              };
+            });
+            envHooked[key] = true;
+          }
+        } catch (e) {}
+      }
+    });
+
+    if (!envHooked['File.exists']) {
+      try {
+        var JavaFile = origUse('java.io.File');
+        var blockedNames = {
+          'su': true, 'busybox': true, 'supersu': true, 'daemonsu': true,
+          'Superuser.apk': true, 'KingoUser.apk': true, 'SuperSu.apk': true,
+          'magisk': true, 'magisk.db': true, 'magisk.img': true, 'ksud': true,
+          'qemud': true, 'qemu_pipe': true
+        };
+        JavaFile.exists.implementation = function () {
+          try {
+            var name = '' + this.getName();
+            if (blockedNames[name]) {
+              return false;
+            }
+            var path = '' + this.getAbsolutePath();
+            if (path.indexOf('/su') !== -1 || path.indexOf('magisk') !== -1 || path.indexOf('superuser') !== -1) {
+              if (path === '/system/xbin/su' || path === '/system/bin/su' || path === '/sbin/su' ||
+                  path === '/vendor/bin/su' || path === '/data/local/xbin/su' || path === '/data/local/bin/su' ||
+                  path === '/data/local/su' || path === '/su/bin/su') {
+                return false;
+              }
+            }
+          } catch (e) {}
+          return this.exists();
+        };
+        envHooked['File.exists'] = true;
+      } catch (e) {}
+    }
+
     if (!envHooked['Build.TAGS']) {
       try {
         var Build = origUse('android.os.Build');
@@ -675,27 +834,9 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
       } catch (e) {}
     }
 
-    if (!envHooked['File.exists']) {
-      try {
-        var JFile = Java.use('java.io.File');
-        var badNames = {
-          'su': true, 'busybox': true, 'supersu': true, 'Superuser.apk': true,
-          'KingoUser.apk': true, 'SuperSu.apk': true, 'magisk': true, 'daemonsu': true
-        };
-        JFile.exists.implementation = function () {
-          try {
-            var name = '' + this.getName();
-            if (badNames[name]) return false;
-          } catch (e) {}
-          return this.exists();
-        };
-        envHooked['File.exists'] = true;
-      } catch (e) {}
-    }
-
     if (!envHooked['SystemProperties']) {
       try {
-        var SystemProperties = Java.use('android.os.SystemProperties');
+        var SystemProperties = useFn('android.os.SystemProperties');
         var safe = {
           'ro.debuggable': '0',
           'ro.secure': '1',
@@ -726,45 +867,21 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     origUse = Java.use.bind(Java);
     try { javaLog = origUse('android.util.Log'); } catch (e) {}
 
-    // Allow reflection Field.set(null, val) on static final fields (e.g.
-    // Build.TAGS in fdciabdul/frida-multiple-bypass) to fall back to Frida's
-    // JNI field setter instead of throwing IllegalAccessException on Android 12+.
-    try {
-      var Field = origUse('java.lang.reflect.Field');
-      Field.set.overload('java.lang.Object', 'java.lang.Object').implementation = function (obj, val) {
-        try {
-          return this.set(obj, val);
-        } catch (e) {
-          try {
-            var clsName = '' + this.getDeclaringClass().getName();
-            var fldName = '' + this.getName();
-            var w = origUse(clsName);
-            if (w && w[fldName]) w[fldName].value = val;
-          } catch (e2) {}
-        }
-      };
-    } catch (e) {}
-
-    // Methods that need in-place overload guarding:
-    // - java.lang.String#contains is blocked completely (causes infinite
-    //   recursion inside frida-java-bridge).
-    // - File/Runtime/ProcessBuilder/SystemProperties/PackageManager methods
-    //   are guarded with blockAll=false so scripts like fdciabdul/frida-multiple-bypass
-    //   that assign `.implementation` multiple times on the same overload
-    //   update the JS callback in-place without crashing ART.
+    // Bootstrap methods whose ART trampolines cause infinite recursion or
+    // extreme slowdowns when replaced on Android 14/15 (API 34/35).
     var blockedClassMethods = {
-      'java.lang.String': ['contains']
-    };
-    var guardedClassMethods = {
+      'java.lang.String': ['contains'],
       'java.io.File': ['exists'],
       'java.io.UnixFileSystem': ['checkAccess'],
-      'java.io.BufferedReader': ['readLine'],
+      'java.io.BufferedReader': ['readLine']
+    };
+    var guardedClassMethods = {
+      'android.os.SystemProperties': ['get'],
+      'android.app.ApplicationPackageManager': ['getPackageInfo', 'getInstallerPackageName'],
       'java.lang.Runtime': ['exec'],
       'java.lang.ProcessImpl': ['start'],
       'java.lang.ProcessBuilder': ['start'],
-      'java.lang.ProcessManager': ['exec'],
-      'android.os.SystemProperties': ['get'],
-      'android.app.ApplicationPackageManager': ['getPackageInfo']
+      'java.lang.ProcessManager': ['exec']
     };
     var hookedJavaOverloads = {};
 
@@ -808,17 +925,17 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
         }
         if (typeof m.overload === 'function') {
           var origOverload = m.overload.bind(m);
-          m.overload = function () {
+          safeSet(m, 'overload', function () {
             var args = Array.prototype.slice.call(arguments);
             var ov = origOverload.apply(m, args);
             return guardOverload(className, methodName, ov, args.join(','), blockAll);
-          };
+          });
         }
-        m.__bogusmipsMethodGuarded = true;
+        safeSet(m, '__bogusmipsMethodGuarded', true);
       } catch (e) {}
     }
 
-    Java.use = function (className) {
+    var customUse = function (className) {
       var name = '' + className;
       var cls = origUse(name);
       if (!cls) return cls;
@@ -837,35 +954,52 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
       return cls;
     };
 
-    Java.enumerateLoadedClassesSync = function () {
+    var customEnumerate = function () {
       return [];
     };
 
-    Java.perform = function (fn) {
+    var customPerform = function (fn) {
       try {
         origPerform(function () {
           try {
             fn();
           } catch (innerErr) {
-            console.log('[frida] ' + innerErr);
+            bogusmipsConsole.log('[frida] ' + innerErr);
           }
         });
       } catch (e) {
-        console.log('[frida] ' + e);
+        bogusmipsConsole.log('[frida] ' + e);
       }
     };
 
-    globalThis.setTimeout = function (cb, delay) {
+    bogusmipsJava = makeDelegate(Java, {
+      use: customUse,
+      enumerateLoadedClassesSync: customEnumerate,
+      perform: customPerform
+    });
+
+    bogusmipsSetTimeout = function (cb, delay) {
       var d = (typeof delay === 'number' && delay > 0) ? delay : 0;
+      if (d === 0) {
+        if (typeof cb === 'function') {
+          customPerform(cb);
+        }
+        return 0;
+      }
       return origSetTimeout(function () {
         if (typeof cb !== 'function') return;
-        Java.perform(cb);
+        customPerform(cb);
       }, d);
     };
+    safeSet(globalThis, 'setTimeout', bogusmipsSetTimeout);
     if (typeof origSetImmediate === 'function') {
-      globalThis.setImmediate = function (cb) {
-        return globalThis.setTimeout(cb, 0);
+      bogusmipsSetImmediate = function (cb) {
+        if (typeof cb === 'function') {
+          customPerform(cb);
+        }
+        return 0;
       };
+      safeSet(globalThis, 'setImmediate', bogusmipsSetImmediate);
     }
   }
 
@@ -875,11 +1009,27 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
 
     for (spec, source) in user_scripts {
         let label = spec.replace('\\', "\\\\").replace('\'', "\\'");
+        // Guard unguarded reflection `.set(null, ...)` on static final Build
+        // fields and recursive `ProcessImpl.start.apply` in older CodeShare
+        // scripts (e.g. fdciabdul/frida-multiple-bypass).
+        let patched = source
+            .replace(
+                "TAGS.set(null, \"release-keys\");",
+                "try { TAGS.set(null, \"release-keys\"); } catch (_e) {}",
+            )
+            .replace(
+                "FINGERPRINT.set(null,",
+                "if (false) FINGERPRINT.set(null,",
+            )
+            .replace(
+                "ProcessImpl.start.apply(this, arguments)",
+                "this.start.apply(this, arguments)",
+            );
         out.push_str(&format!(
             r#"    {{
       spec: '{label}',
-      run: function () {{
-{source}
+      run: function (send, console, setTimeout, setImmediate, Memory, Module, Interceptor, Java) {{
+{patched}
       }}
     }},
 "#
@@ -889,7 +1039,7 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     out.push_str(
         r#"  ];
 
-  var delays = [1000, 2000, 3500, 5500, 8000];
+  var delays = [0, 200, 800, 1800, 3500, 6000];
   var attempt = 0;
   function bootAfterArt() {
     try {
@@ -898,21 +1048,32 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
         applyBaselineEnvHooks();
         for (var i = 0; i < scripts.length; i++) {
           var s = scripts[i];
-          console.log('[bogusmips:script:start] ' + s.spec);
+          bogusmipsConsole.log('[bogusmips:script:start] ' + s.spec);
           try {
-            s.run();
-            console.log('[bogusmips:script:ok] ' + s.spec);
+            s.run(
+              bogusmipsSend,
+              bogusmipsConsole,
+              bogusmipsSetTimeout,
+              bogusmipsSetImmediate,
+              bogusmipsMemory,
+              bogusmipsModule,
+              bogusmipsInterceptor,
+              bogusmipsJava
+            );
+            bogusmipsConsole.log('[bogusmips:script:ok] ' + s.spec);
           } catch (scriptErr) {
-            console.log('[bogusmips:script:error] ' + s.spec + ' | ' + scriptErr);
+            bogusmipsConsole.log('[bogusmips:script:error] ' + s.spec + ' | ' + scriptErr);
           }
         }
-        // Re-apply baseline hooks for classes (e.g. RootBeer) loaded lazily.
         origSetTimeout(function () {
           try { origPerform(applyBaselineEnvHooks); } catch (e) {}
-        }, 1500);
+        }, 500);
         origSetTimeout(function () {
           try { origPerform(applyBaselineEnvHooks); } catch (e) {}
-        }, 3500);
+        }, 1800);
+        origSetTimeout(function () {
+          try { origPerform(applyBaselineEnvHooks); } catch (e) {}
+        }, 3800);
       });
     } catch (artErr) {
       attempt += 1;
@@ -920,12 +1081,12 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
         origSetTimeout(bootAfterArt, delays[attempt] - delays[attempt - 1]);
       } else {
         for (var j = 0; j < scripts.length; j++) {
-          console.log('[bogusmips:script:error] ' + scripts[j].spec + ' | ' + artErr);
+          bogusmipsConsole.log('[bogusmips:script:error] ' + scripts[j].spec + ' | ' + artErr);
         }
       }
     }
   }
-  origSetTimeout(bootAfterArt, delays[0]);
+  bootAfterArt();
 })();
 "#,
     );

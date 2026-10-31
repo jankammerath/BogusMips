@@ -53,35 +53,40 @@ fn main() {
         std::process::exit(2);
     };
     let seconds: u64 = positional.next().and_then(|s| s.parse().ok()).unwrap_or(90);
-    let path = PathBuf::from(&input);
-    let pkg = Package::open(&path).expect("open package");
-
-    // Extract the APK(s) to install.
     let tmp = std::env::temp_dir().join(format!("bogusmips-net-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
     let mut apks = Vec::new();
     let mut package_name = None;
-    if pkg.kind == PackageKind::Apk {
-        apks.push(path.clone());
+    if let Some(pkg_id) = input.strip_prefix("pkg:") {
+        package_name = Some(pkg_id.to_owned());
     } else {
-        for (i, archive) in pkg.archives.iter().enumerate().skip(1) {
-            if let Some(file) = archive.source_file {
-                let data = pkg.read_file(file).expect("read inner apk");
-                let out = tmp.join(format!("part{i}.apk"));
-                std::fs::write(&out, &data.bytes).unwrap();
-                apks.push(out);
+        let path = PathBuf::from(&input);
+        let pkg = Package::open(&path).expect("open package");
+
+        // Extract the APK(s) to install.
+        if pkg.kind == PackageKind::Apk {
+            apks.push(path.clone());
+        } else {
+            for (i, archive) in pkg.archives.iter().enumerate().skip(1) {
+                if let Some(file) = archive.source_file {
+                    let data = pkg.read_file(file).expect("read inner apk");
+                    let out = tmp.join(format!("part{i}.apk"));
+                    std::fs::write(&out, &data.bytes).unwrap();
+                    apks.push(out);
+                }
             }
         }
-    }
-    for archive in &pkg.archives {
-        if let Some(m) = &archive.manifest {
-            if let Some(p) = &m.package {
-                package_name = Some(p.clone());
-                break;
+        for archive in &pkg.archives {
+            if let Some(m) = &archive.manifest {
+                if let Some(p) = &m.package {
+                    package_name = Some(p.clone());
+                    break;
+                }
             }
         }
     }
     eprintln!("package: {package_name:?}, {} apk(s)", apks.len());
+    let controller_pkg = package_name.clone();
 
     let mut controller = NetworkController::new();
     std::fs::write(tmp.join("ca.pem"), controller.ca_pem()).unwrap();
@@ -94,12 +99,19 @@ fn main() {
 
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut last_phase = String::new();
+    let mut last_log_len = 0;
     let mut last_count = 0;
     while Instant::now() < deadline {
         let (phase, error, log) = controller.status_snapshot();
         if phase.label() != last_phase {
             last_phase = phase.label().to_owned();
-            eprintln!("[{last_phase}] {}", log.last().cloned().unwrap_or_default());
+            eprintln!("[{last_phase}]");
+        }
+        if log.len() > last_log_len {
+            for line in &log[last_log_len..] {
+                eprintln!("  log: {line}");
+            }
+            last_log_len = log.len();
         }
         if let Some(error) = error {
             eprintln!("FAILED: {error}");
@@ -118,6 +130,39 @@ fn main() {
         }
         let _ = std::io::stderr().flush();
         std::thread::sleep(Duration::from_millis(500));
+    }
+
+    for (spec, st) in controller.script_statuses() {
+        eprintln!("script {spec}: {st:?}");
+    }
+    let diag_pkg = controller_pkg.unwrap_or_else(|| "de.clara.sharing.app".to_owned());
+    if let Some(sdk) = controller.sdk() {
+        let cmd = format!(
+            "PID=$(pidof {diag_pkg}); echo PID=$PID; ls -laZ /data/local/tmp/bogusmips*; cat /data/local/tmp/bogusmips-frida.log; if [ -n \"$PID\" ]; then grep -iE 'bogusmips|frida' /proc/$PID/maps; logcat -d --pid=$PID | tail -n 80; fi"
+        );
+        if let Ok(out) = std::process::Command::new(sdk.adb())
+            .args(["shell", "su", "root", "sh", "-c", &cmd])
+            .output()
+        {
+            eprintln!("--- process & gadget diagnostics ---\n{}", String::from_utf8_lossy(&out.stdout));
+        }
+        if let Ok(out) = std::process::Command::new(sdk.adb())
+            .args(["logcat", "-d"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            eprintln!("--- relevant logcat ---");
+            for line in text.lines().filter(|l| {
+                let low = l.to_ascii_lowercase();
+                low.contains("bogusmips")
+                    || low.contains("frida")
+                    || low.contains("androidruntime")
+                    || low.contains(&diag_pkg)
+                    || low.contains("fatal")
+            }) {
+                eprintln!("  {line}");
+            }
+        }
     }
 
     let flows = controller.capture().snapshot();

@@ -144,6 +144,25 @@ impl Status {
             self.log(format!("✖ Frida script error ({spec}): {err}"));
             return;
         }
+        if trimmed.starts_with('[') && trimmed.starts_with("[bogusmips:") {
+            self.log(format!("[frida] {trimmed}"));
+            return;
+        }
+        if trimmed.starts_with("{\"type\":\"error\"") {
+            let err = trimmed
+                .split("\"description\":\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or(trimmed)
+                .to_owned();
+            for (_, state) in &mut self.scripts {
+                if !matches!(state, ScriptState::Active { .. }) {
+                    *state = ScriptState::Error(err.clone());
+                }
+            }
+            self.log(format!("✖ Frida runtime error: {err}"));
+            return;
+        }
 
         // Any output emitted by the script in the target process confirms the
         // script is running and increments its message counter.
@@ -382,7 +401,8 @@ fn run_session(
                 status
                     .lock()
                     .unwrap()
-                    .log("Downloading the frida gadget…".to_owned());
+                    .log("Preparing Frida runtime (frida-inject + gadget)…".to_owned());
+                let inject = bypass::ensure_inject(&cache, frida_abi)?;
                 let gadget = bypass::ensure_gadget(&cache, frida_abi)?;
                 let mut loaded = Vec::with_capacity(config.frida_scripts.len());
                 for spec in &config.frida_scripts {
@@ -405,7 +425,7 @@ fn run_session(
                 }
                 let combined = bypass::build_gadget_script(&loaded);
                 emulator.clear_logcat();
-                let res = emulator.install_frida_script(&gadget, package, &combined)?;
+                let res = emulator.install_frida_script(&inject, &gadget, package, &combined)?;
                 {
                     let mut s = status.lock().unwrap();
                     for (canonical, _) in &loaded {
@@ -418,6 +438,13 @@ fn run_session(
             step!(Phase::InstallingBypass, &label, install_frida());
         }
         step!(Phase::Launching, "Launching the app", emulator.launch(package));
+        if needs_frida {
+            step!(
+                Phase::InstallingBypass,
+                "Attaching Frida runtime to app process",
+                emulator.attach_frida_script(package)
+            );
+        }
     }
 
     set_phase(Phase::Capturing, "Capturing traffic");

@@ -308,15 +308,32 @@ impl Emulator {
 
     /// Switches adbd to root and remounts the system partition.
     pub fn enable_root(&self) -> Step {
-        let out = self.adb(&["root"])?;
-        if out.to_lowercase().contains("cannot run as root") {
-            return Err("this emulator image cannot be rooted (use a non-Play-Store image)".into());
-        }
-        // adbd restarts; wait for it to come back.
-        std::thread::sleep(Duration::from_secs(2));
         let _ = self.adb(&["wait-for-device"]);
-        let _ = self.adb(&["remount"]);
-        Ok("root enabled".into())
+        let mut last_err = String::new();
+        for attempt in 0..3 {
+            match self.adb(&["root"]) {
+                Ok(out) => {
+                    if out.to_lowercase().contains("cannot run as root") {
+                        return Err(
+                            "this emulator image cannot be rooted (use a non-Play-Store image)"
+                                .into(),
+                        );
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                    let _ = self.adb(&["wait-for-device"]);
+                    let _ = self.adb(&["remount"]);
+                    return Ok("root enabled".into());
+                }
+                Err(e) => {
+                    last_err = e;
+                    if attempt + 1 < 3 {
+                        std::thread::sleep(Duration::from_secs(1));
+                        let _ = self.adb(&["wait-for-device"]);
+                    }
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// Pushes the CA (PEM) and installs it as a system trust anchor.
@@ -356,7 +373,13 @@ impl Emulator {
         } else {
             args.push("install".into());
         }
-        args.extend(["-r".into(), "-t".into(), "-g".into()]);
+        args.extend([
+            "-r".into(),
+            "-t".into(),
+            "-g".into(),
+            "-i".into(),
+            "com.android.vending".into(),
+        ]);
         for apk in apks {
             args.push(apk.to_string_lossy().into_owned());
         }
@@ -403,39 +426,54 @@ impl Emulator {
             .map(|s| s.trim().to_owned())
     }
 
-    /// Pushes `gadget_local`, its config, and the assembled `script_js` for
-    /// the user-selected Frida scripts, then sets `wrap.<package>` so
-    /// `frida-gadget` is `LD_PRELOAD`ed on app launch.
+    /// Pushes `inject_local` (`frida-inject`), `gadget_local` (`frida-gadget`),
+    /// and the assembled `script_js` to the device, prepares the device
+    /// environment, and arms a background injector for `package`.
     pub fn install_frida_script(
         &self,
+        inject_local: &Path,
         gadget_local: &Path,
         package: &str,
         script_js: &str,
     ) -> Step {
+        const INJECT: &str = "/data/local/tmp/bogusmips-frida-inject";
         const GADGET: &str = "/data/local/tmp/bogusmips-gadget.so";
         const SCRIPT: &str = "/data/local/tmp/bogusmips-bypass.js";
-        // frida accepts either form; push both so it is found regardless.
         const CONFIG: &str = "/data/local/tmp/bogusmips-gadget.config";
         const CONFIG_SO: &str = "/data/local/tmp/bogusmips-gadget.config.so";
         const ARM_SCRIPT: &str = "/data/local/tmp/bogusmips_frida_arm.sh";
+        const ATTACH_SCRIPT: &str = "/data/local/tmp/bogusmips_frida_attach.sh";
 
-        let local = gadget_local.to_string_lossy();
-        self.adb(&["push", &local, GADGET])?;
+        let inject_str = inject_local.to_string_lossy();
+        self.adb(&["push", &inject_str, INJECT])?;
+        let gadget_str = gadget_local.to_string_lossy();
+        self.adb(&["push", &gadget_str, GADGET])?;
         self.push_bytes(script_js.as_bytes(), SCRIPT)?;
         let cfg = bypass::gadget_config(SCRIPT);
         self.push_bytes(cfg.as_bytes(), CONFIG)?;
         self.push_bytes(cfg.as_bytes(), CONFIG_SO)?;
 
+        let attach_sh = frida_attach_script(package);
+        self.push_bytes(attach_sh.as_bytes(), ATTACH_SCRIPT)?;
         let arm_sh = frida_arm_script(package);
         self.push_bytes(arm_sh.as_bytes(), ARM_SCRIPT)?;
         let out = self
             .adb(&["shell", "su", "root", "sh", ARM_SCRIPT])
             .or_else(|_| self.adb(&["shell", "sh", ARM_SCRIPT]))?;
         if out.contains("ARMED") {
-            Ok("Frida gadget armed".into())
+            Ok("Frida runtime armed".into())
         } else {
-            Err(format!("could not arm Frida gadget: {out}"))
+            Err(format!("could not arm Frida runtime: {out}"))
         }
+    }
+
+    /// Attaches `frida-inject` to the running `package` process immediately
+    /// after launch so scripts execute in the live ART runtime.
+    pub fn attach_frida_script(&self, package: &str) -> Step {
+        const ATTACH_SCRIPT: &str = "/data/local/tmp/bogusmips_frida_attach.sh";
+        let _ = package;
+        self.adb(&["shell", "su", "root", "sh", ATTACH_SCRIPT])
+            .or_else(|_| self.adb(&["shell", "sh", ATTACH_SCRIPT]))
     }
 
     /// Clears the device's logcat ring buffer and on-device Frida telemetry log
@@ -472,10 +510,9 @@ impl Emulator {
     }
 }
 
-/// Shell script executed as `root` on the device to label `/data/local/tmp`
-/// and the Frida gadget files so `untrusted_app` can traverse `/data/local/tmp`,
-/// map `bogusmips-gadget.so`, read its config/script, and append telemetry to
-/// [`bypass::FRIDA_DEVICE_LOG_PATH`].
+/// Shell script executed as `root` on the device to set up the Frida runtime
+/// environment (`/data/local/tmp/bogusmips-frida-inject`, gadget, script, and
+/// telemetry log) and hide `/system/xbin/su` from app mount namespaces.
 pub fn frida_arm_script(package: &str) -> String {
     let prop = format!("wrap.{package}");
     let prop_short = if prop.len() > 31 {
@@ -484,41 +521,85 @@ pub fn frida_arm_script(package: &str) -> String {
         None
     };
     let short_cmd = prop_short
-        .map(|s| format!("setprop \"{s}\" \"LD_PRELOAD=/data/local/tmp/bogusmips-gadget.so\" 2>/dev/null\n"))
+        .map(|s| format!("setprop \"{s}\" \"\" 2>/dev/null\n"))
         .unwrap_or_default();
     let log_path = bypass::FRIDA_DEVICE_LOG_PATH;
     format!(
-        r#"GADGET=/data/local/tmp/bogusmips-gadget.so
+        r#"INJECT=/data/local/tmp/bogusmips-frida-inject
+GADGET=/data/local/tmp/bogusmips-gadget.so
 SCRIPT=/data/local/tmp/bogusmips-bypass.js
 CONFIG=/data/local/tmp/bogusmips-gadget.config
 CONFIG_SO=/data/local/tmp/bogusmips-gadget.config.so
 LOG={log_path}
+EMPTY_XBIN=/data/local/tmp/bogusmips-empty-xbin
 
+killall -9 bogusmips-frida-inject 2>/dev/null
 : > "$LOG"
 chmod 777 /data/local/tmp
-chmod 755 "$GADGET"
+chmod 755 "$INJECT" "$GADGET"
 chmod 644 "$SCRIPT" "$CONFIG" "$CONFIG_SO"
 chmod 666 "$LOG"
-# On Android 14/15, untrusted_app is denied `search` on shell_data_file
-# directories; relabel /data/local/tmp to system_data_file, the gadget
-# payloads to system_file, and the telemetry log to apk_data_file.
 chcon u:object_r:system_data_file:s0 /data/local/tmp 2>/dev/null
-chcon u:object_r:system_file:s0 "$GADGET" "$SCRIPT" "$CONFIG" "$CONFIG_SO" 2>/dev/null
+chcon u:object_r:system_file:s0 "$INJECT" "$GADGET" "$SCRIPT" "$CONFIG" "$CONFIG_SO" 2>/dev/null
 chcon u:object_r:apk_data_file:s0 "$LOG" 2>/dev/null
-setenforce 0 2>/dev/null
 
-# Prevent unspecialized app process (USAP) pool from bypassing wrap.<package>.
-setprop persist.device_config.runtime_native.usap_pool_enabled false 2>/dev/null
-setprop persist.sys.usap_pool_enabled false 2>/dev/null
+# Hide /system/xbin/su inside zygote and app mount namespaces while keeping
+# /proc/1/ns/mnt (init + adbd) untouched so `adb shell su root` keeps working.
+mkdir -p -m 755 "$EMPTY_XBIN"
+chown root:root "$EMPTY_XBIN" 2>/dev/null
+chcon u:object_r:system_file:s0 "$EMPTY_XBIN" 2>/dev/null
+INIT_NS=$(readlink /proc/1/ns/mnt 2>/dev/null)
+SEEN=" $INIT_NS "
+for P in /proc/[0-9]*; do
+  NS=$(readlink "$P/ns/mnt" 2>/dev/null)
+  [ -z "$NS" ] && continue
+  case "$SEEN" in *" $NS "*) continue;; esac
+  SEEN="$SEEN$NS "
+  nsenter -t "${{P#/proc/}}" -m -- mount --bind "$EMPTY_XBIN" /system/xbin 2>/dev/null
+done
 
-# Hide /system/xbin/su from untrusted_app (other) while keeping root:shell
-# access intact for `adb shell su root`.
-chown root:shell /system/xbin 2>/dev/null
-chmod 750 /system/xbin 2>/dev/null
-
-setprop "{prop}" "LD_PRELOAD=$GADGET"
-{short_cmd}am force-stop "{package}" 2>/dev/null
+# Clear any wrap.<package> property so the app forks cleanly from Zygote
+# instead of entering WrapperInit (which triggers seccomp SIGSYS in idmap2).
+setprop "{prop}" "" 2>/dev/null
+{short_cmd}pm set-installer "{package}" com.android.vending 2>/dev/null
+am force-stop "{package}" 2>/dev/null
 echo ARMED"#
+    )
+}
+
+/// Shell script executed as `root` right after launching `package` to attach
+/// `frida-inject` to the running app process and stream script output to
+/// [`bypass::FRIDA_DEVICE_LOG_PATH`].
+pub fn frida_attach_script(package: &str) -> String {
+    let log_path = bypass::FRIDA_DEVICE_LOG_PATH;
+    format!(
+        r#"INJECT=/data/local/tmp/bogusmips-frida-inject
+SCRIPT=/data/local/tmp/bogusmips-bypass.js
+LOG={log_path}
+PKG="{package}"
+
+PID=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  PID=$(pidof "$PKG" 2>/dev/null)
+  for P in $PID; do
+    PID="$P"
+    break
+  done
+  if [ -n "$PID" ]; then
+    break
+  fi
+  sleep 0.1
+done
+
+if [ -z "$PID" ]; then
+  echo "[bogusmips:script:error] $PKG | target process did not start" >> "$LOG"
+  exit 1
+fi
+
+setenforce 0 2>/dev/null
+"$INJECT" -p "$PID" -s "$SCRIPT" --eternalize >> "$LOG" 2>&1
+RC=$?
+echo "ATTACHED:$PID:RC=$RC""#
     )
 }
 
@@ -619,15 +700,17 @@ mod tests {
     }
 
     #[test]
-    fn frida_arm_script_labels_tmp_dir_and_sets_wrap_prop() {
-        let script = frida_arm_script("de.clara.sharing.app");
-        assert!(script.contains("chcon u:object_r:system_data_file:s0 /data/local/tmp"));
-        assert!(script.contains("chcon u:object_r:system_file:s0"));
-        assert!(script.contains("setenforce 0"));
-        assert!(script.contains("usap_pool_enabled false"));
-        assert!(script.contains("chmod 750 /system/xbin"));
-        assert!(script.contains("setprop \"wrap.de.clara.sharing.app\""));
-        assert!(script.contains("echo ARMED"));
+    fn frida_arm_and_attach_scripts_setup_runtime_and_hide_su() {
+        let arm = frida_arm_script("de.clara.sharing.app");
+        assert!(arm.contains("chcon u:object_r:system_data_file:s0 /data/local/tmp"));
+        assert!(arm.contains("chcon u:object_r:system_file:s0"));
+        assert!(arm.contains("mount --bind \"$EMPTY_XBIN\" /system/xbin"));
+        assert!(arm.contains("setprop \"wrap.de.clara.sharing.app\" \"\""));
+        assert!(arm.contains("echo ARMED"));
+
+        let attach = frida_attach_script("de.clara.sharing.app");
+        assert!(attach.contains("bogusmips-frida-inject"));
+        assert!(attach.contains("ATTACHED:"));
     }
 
     #[test]
