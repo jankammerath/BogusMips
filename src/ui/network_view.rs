@@ -8,7 +8,7 @@ use super::theme;
 use crate::inspect::group_digits;
 use crate::net::bypass::{FridaConfig, FridaScriptEntry, ScriptSource, parse_script_specs};
 use crate::net::capture::Scheme;
-use crate::net::controller::{NetworkController, Phase};
+use crate::net::controller::{NetworkController, Phase, ScriptState};
 use crate::net::emulator::Avd;
 
 const ROW_HEIGHT: f32 = 38.0;
@@ -216,12 +216,12 @@ pub fn show(
                 {
                     state.save_if_enabled();
                 }
-
-                ui.add_space(4.0);
-                if let Some(a) = frida_scripts_block(ui, state) {
-                    action = Some(a);
-                }
             });
+
+            ui.add_space(4.0);
+            if let Some(a) = frida_scripts_block(ui, controller, state, running) {
+                action = Some(a);
+            }
             ui.add_space(6.0);
 
             ui.horizontal(|ui| {
@@ -279,9 +279,15 @@ pub fn show(
     action
 }
 
-fn frida_scripts_block(ui: &mut egui::Ui, state: &mut NetworkViewState) -> Option<NetworkAction> {
+fn frida_scripts_block(
+    ui: &mut egui::Ui,
+    controller: &NetworkController,
+    state: &mut NetworkViewState,
+    running: bool,
+) -> Option<NetworkAction> {
     let mut action = None;
     let enabled_count = state.scripts.iter().filter(|s| s.enabled).count();
+    let runtime_states = controller.script_statuses();
     let header_text = if enabled_count > 0 {
         format!("Frida scripts ({enabled_count} active)")
     } else {
@@ -292,52 +298,55 @@ fn frida_scripts_block(ui: &mut egui::Ui, state: &mut NetworkViewState) -> Optio
 
     // Input row: text field (CodeShare slug, `frida --codeshare ...`, URL, or .js file) + Add + Browse.
     let mut add_requested = false;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let buttons_width = 66.0;
-        let input_width = (ui.available_width() - buttons_width).max(60.0);
-        let input_resp = egui::Frame::NONE
-            .fill(theme::INPUT)
-            .stroke(Stroke::new(1.0, theme::INPUT))
-            .corner_radius(2)
-            .inner_margin(egui::Margin {
-                left: 6,
-                right: 4,
-                top: 3,
-                bottom: 3,
-            })
-            .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut state.script_input)
-                        .id(egui::Id::new(FRIDA_SCRIPT_INPUT_ID))
-                        .frame(false)
-                        .hint_text("dzonerzy/aesinfo or script.js")
-                        .desired_width(input_width - 10.0),
-                )
-            })
-            .inner
-            .on_hover_text(
-                "Add a Frida script by CodeShare slug (e.g. dzonerzy/aesinfo or \
-                 frida --codeshare dzonerzy/aesinfo), https:// URL, or local .js path.",
-            );
+    ui.add_enabled_ui(!running, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let buttons_width = 66.0;
+            let input_width = (ui.available_width() - buttons_width).max(60.0);
+            let input_resp = egui::Frame::NONE
+                .fill(theme::INPUT)
+                .stroke(Stroke::new(1.0, theme::INPUT))
+                .corner_radius(2)
+                .inner_margin(egui::Margin {
+                    left: 6,
+                    right: 4,
+                    top: 3,
+                    bottom: 3,
+                })
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.script_input)
+                            .id(egui::Id::new(FRIDA_SCRIPT_INPUT_ID))
+                            .frame(false)
+                            .hint_text("dzonerzy/aesinfo or script.js")
+                            .desired_width(input_width - 10.0),
+                    )
+                })
+                .inner
+                .on_hover_text(
+                    "Add a Frida script by CodeShare slug (e.g. dzonerzy/aesinfo or \
+                     frida --codeshare dzonerzy/aesinfo), https:// URL, or local .js path.",
+                );
 
-        if input_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-            add_requested = true;
-        }
-        if ui
-            .add_enabled(
-                !state.script_input.trim().is_empty(),
-                egui::Button::new("Add").min_size(vec2(38.0, 22.0)),
-            )
-            .on_hover_text("Add Frida script")
-            .clicked()
-        {
-            add_requested = true;
-        }
-        if icons::button(ui, Icon::Files, 22.0, "Browse for a local Frida script (.js)…").clicked()
-        {
-            action = Some(NetworkAction::PickFridaScript);
-        }
+            if input_resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                add_requested = true;
+            }
+            if ui
+                .add_enabled(
+                    !state.script_input.trim().is_empty(),
+                    egui::Button::new("Add").min_size(vec2(38.0, 22.0)),
+                )
+                .on_hover_text("Add Frida script")
+                .clicked()
+            {
+                add_requested = true;
+            }
+            if icons::button(ui, Icon::Files, 22.0, "Browse for a local Frida script (.js)…")
+                .clicked()
+            {
+                action = Some(NetworkAction::PickFridaScript);
+            }
+        });
     });
 
     if add_requested {
@@ -362,17 +371,30 @@ fn frida_scripts_block(ui: &mut egui::Ui, state: &mut NetworkViewState) -> Optio
                     let tooltip = ScriptSource::parse(&entry.spec)
                         .map(|s| s.description())
                         .unwrap_or_else(|_| entry.spec.clone());
+                    let runtime = runtime_states
+                        .iter()
+                        .find(|(s, _)| s == &entry.spec)
+                        .map(|(_, st)| st);
                     ui.horizontal(|ui| {
-                        if ui
-                            .checkbox(&mut entry.enabled, &entry.spec)
-                            .on_hover_text(tooltip)
-                            .changed()
-                        {
-                            toggled = true;
-                        }
+                        ui.add_enabled_ui(!running, |ui| {
+                            if ui
+                                .checkbox(&mut entry.enabled, &entry.spec)
+                                .on_hover_text(tooltip)
+                                .changed()
+                            {
+                                toggled = true;
+                            }
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icons::button(ui, Icon::Close, 18.0, "Remove script").clicked() {
-                                remove_idx = Some(idx);
+                            ui.add_enabled_ui(!running, |ui| {
+                                if icons::button(ui, Icon::Close, 18.0, "Remove script").clicked() {
+                                    remove_idx = Some(idx);
+                                }
+                            });
+                            if entry.enabled {
+                                if let Some(st) = runtime {
+                                    script_state_badge(ui, st);
+                                }
                             }
                         });
                     });
@@ -389,6 +411,42 @@ fn frida_scripts_block(ui: &mut egui::Ui, state: &mut NetworkViewState) -> Optio
     action
 }
 
+fn script_state_badge(ui: &mut egui::Ui, state: &ScriptState) {
+    let (label, color, tip) = match state {
+        ScriptState::Loading => (
+            "Loading…".to_owned(),
+            egui::Color32::from_rgb(0xcc, 0xa7, 0x00),
+            "Downloading or loading Frida script on the host…".to_owned(),
+        ),
+        ScriptState::Injected => (
+            "Armed".to_owned(),
+            egui::Color32::from_rgb(0x56, 0x9c, 0xd6),
+            "Pushed to device with frida-gadget; waiting for app runtime to execute it…".to_owned(),
+        ),
+        ScriptState::Active { messages } => {
+            let text = if *messages > 0 {
+                format!("✔ Working ({messages})")
+            } else {
+                "✔ Working".to_owned()
+            };
+            (
+                text,
+                egui::Color32::from_rgb(0x4e, 0xc9, 0xb0),
+                format!(
+                    "Script is loaded and working inside the target app ({messages} log message(s) emitted)."
+                ),
+            )
+        }
+        ScriptState::Error(err) => (
+            "✖ Error".to_owned(),
+            theme::ERROR,
+            format!("Script error: {err}"),
+        ),
+    };
+    ui.add(egui::Label::new(RichText::new(label).size(10.5).color(color)).sense(Sense::hover()))
+        .on_hover_text(tip);
+}
+
 fn status_block(
     ui: &mut egui::Ui,
     controller: &NetworkController,
@@ -396,6 +454,7 @@ fn status_block(
     state: &mut NetworkViewState,
 ) {
     let (_, error, log) = controller.status_snapshot();
+    let script_states = controller.script_statuses();
     ui.horizontal(|ui| {
         if phase.is_active() && phase != Phase::Capturing {
             ui.add(egui::Spinner::new().size(12.0));
@@ -418,6 +477,61 @@ fn status_block(
     if let Some(error) = &error {
         ui.add(egui::Label::new(RichText::new(error).size(12.0).color(theme::ERROR)).wrap());
     }
+    if !script_states.is_empty() {
+        let total = script_states.len();
+        let active = script_states
+            .iter()
+            .filter(|(_, s)| matches!(s, ScriptState::Active { .. }))
+            .count();
+        let messages: usize = script_states
+            .iter()
+            .map(|(_, s)| match s {
+                ScriptState::Active { messages } => *messages,
+                _ => 0,
+            })
+            .sum();
+        let first_err = script_states.iter().find_map(|(spec, s)| match s {
+            ScriptState::Error(e) => Some((spec.as_str(), e.as_str())),
+            _ => None,
+        });
+        let (summary, color) = if let Some((spec, err)) = first_err {
+            (
+                format!("✖ Frida ({spec}): {err}"),
+                theme::ERROR,
+            )
+        } else if active == total {
+            let msg_suffix = if messages > 0 {
+                format!(" ({messages} logs)")
+            } else {
+                String::new()
+            };
+            if total == 1 {
+                (
+                    format!("✔ Frida: {} loaded & working{msg_suffix}", script_states[0].0),
+                    egui::Color32::from_rgb(0x4e, 0xc9, 0xb0),
+                )
+            } else {
+                (
+                    format!("✔ Frida: {active}/{total} scripts loaded & working{msg_suffix}"),
+                    egui::Color32::from_rgb(0x4e, 0xc9, 0xb0),
+                )
+            }
+        } else if script_states
+            .iter()
+            .any(|(_, s)| matches!(s, ScriptState::Injected))
+        {
+            (
+                format!("⏳ Frida: {active}/{total} working (waiting for app runtime…)"),
+                egui::Color32::from_rgb(0x56, 0x9c, 0xd6),
+            )
+        } else {
+            (
+                "⏳ Frida: loading script(s)…".to_owned(),
+                theme::TEXT_DIM,
+            )
+        };
+        ui.add(egui::Label::new(RichText::new(summary).size(11.5).color(color)).wrap());
+    }
     // A collapsible log of the session steps and Frida script output.
     if !log.is_empty() {
         let header = if state.log_expanded { "▾ Log" } else { "▸ Log" };
@@ -439,7 +553,11 @@ fn status_block(
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             for line in &log {
-                                let color = if line.starts_with("[frida]") {
+                                let color = if line.starts_with("✔") {
+                                    egui::Color32::from_rgb(0x4e, 0xc9, 0xb0)
+                                } else if line.starts_with("✖") {
+                                    theme::ERROR
+                                } else if line.starts_with("[frida]") {
                                     egui::Color32::from_rgb(0x9c, 0xdc, 0xfe)
                                 } else {
                                     theme::TEXT_DIM

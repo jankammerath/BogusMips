@@ -557,12 +557,23 @@ pub fn load_script(cache_dir: &Path, spec: &str) -> Result<(String, String), Str
 
 /// Assembles the single JavaScript payload executed by `frida-gadget`:
 /// - When `bypass_checks` is `true`, includes [`bypass_script`].
-/// - When `user_scripts` (`(spec, js_source)`) is non-empty, installs a bridge
-///   that forwards `send(...)` messages to `console.log` (so output from scripts
-///   such as `dzonerzy/aesinfo` appears in logcat and the Network log without a
-///   Frida host client) and makes `Java.perform` resilient to early `LD_PRELOAD`
-///   invocation before ART is initialized, then runs each user script in its own
-///   isolated scope once ART is up.
+/// - When `user_scripts` (`(spec, js_source)`) is non-empty, installs a
+///   compatibility and safety shim for Frida CodeShare scripts (such as
+///   `dzonerzy/aesinfo` and `fdciabdul/frida-multiple-bypass`):
+///   1. Forwards `send(...)` messages to `console.log` so output appears in
+///      `logcat` and the BogusMips Network log without a Frida TCP client.
+///   2. Polyfills legacy Frida 12 `Memory.readCString` / `readUtf8String` /
+///      `writeUtf8String` APIs and guards `Interceptor.attach` against hooking
+///      `libc.so` `fopen`/`access`/`__system_property_get`/`system` (which
+///      corrupt `.rodata` or deadlock `frida-gadget` on Android 14/15).
+///   3. Protects ART bootstrap classes (`java.lang.String`, `java.io.File`,
+///      `java.io.UnixFileSystem`, `java.io.BufferedReader`, `java.lang.Runtime`,
+///      `java.lang.ProcessImpl`, `java.lang.ProcessBuilder`) and prevents
+///      repeated `.implementation` replacement on the same method overload from
+///      corrupting ART trampolines.
+///   4. Runs `setTimeout` callbacks and each user script inside `Java.perform`
+///      once ART is initialized (~2s after `LD_PRELOAD`), emitting structured
+///      `[bogusmips:script:start|ok|error]` status markers for the UI.
 pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)]) -> String {
     if bypass_checks && user_scripts.is_empty() {
         return bypass_script().to_owned();
@@ -579,36 +590,223 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
     if !user_scripts.is_empty() {
         out.push_str(
             r#"(function () {
-  if (typeof globalThis.__bogusmipsWrapped === 'undefined') {
-    globalThis.__bogusmipsWrapped = true;
-    if (typeof send === 'function') {
-      var origSend = send;
-      globalThis.send = function (message, data) {
-        try {
-          var text = (typeof message === 'string') ? message : JSON.stringify(message);
-          console.log(text);
-        } catch (e) {}
-        try { return origSend(message, data); } catch (e) {}
+  if (typeof globalThis.__bogusmipsWrapped !== 'undefined') return;
+  globalThis.__bogusmipsWrapped = true;
+  var origSetTimeout = globalThis.setTimeout;
+  var origSetImmediate = globalThis.setImmediate;
+  globalThis.__bogusmipsOrigSetTimeout = origSetTimeout;
+  globalThis.__bogusmipsArtReady = false;
+
+  // 1. Forward send(...) to console.log so CodeShare scripts using send()
+  //    appear in logcat and the Network view.
+  if (typeof send === 'function') {
+    var origSend = send;
+    globalThis.send = function (message, data) {
+      try {
+        var text = (typeof message === 'string') ? message : JSON.stringify(message);
+        console.log(text);
+      } catch (e) {}
+      try { return origSend(message, data); } catch (e) {}
+    };
+  }
+
+  // 2. Polyfill Frida 12 Memory.* helpers used by older CodeShare scripts
+  //    (e.g. fdciabdul/frida-multiple-bypass).
+  if (typeof Memory !== 'undefined') {
+    if (typeof Memory.readCString !== 'function') {
+      Memory.readCString = function (p) {
+        try { return ptr(p).readCString(); } catch (e) { return ''; }
       };
     }
-    if (typeof Java !== 'undefined' && typeof Java.perform === 'function') {
-      var origPerform = Java.perform.bind(Java);
-      Java.perform = function (fn) {
-        var retryDelays = [1500, 2000, 2500];
-        var attempt = 0;
-        function tryPerform() {
-          try {
-            origPerform(fn);
-          } catch (e) {
-            if (attempt < retryDelays.length) {
-              var d = retryDelays[attempt++];
-              setTimeout(tryPerform, d);
-            } else {
-              console.log('[frida] Java.perform failed: ' + e);
+    if (typeof Memory.readUtf8String !== 'function') {
+      Memory.readUtf8String = function (p) {
+        try { return ptr(p).readUtf8String(); } catch (e) { return ''; }
+      };
+    }
+    if (typeof Memory.writeUtf8String !== 'function') {
+      Memory.writeUtf8String = function (p, _s) {
+        // Never overwrite caller string literals in-place (.rodata -> SIGSEGV).
+        return p;
+      };
+    }
+  }
+
+  // 3. Guard Module.findExportByName & Interceptor.attach against hooking
+  //    high-frequency libc.so functions (fopen, access, __system_property_get,
+  //    system) that deadlock frida-gadget or corrupt read-only caller memory.
+  var unsafeNativeAddrs = {};
+  var unsafeLibcSymbols = {
+    'fopen': true, 'fopen64': true, 'open': true, 'open64': true, 'openat': true,
+    'access': true, 'faccessat': true, 'stat': true, 'lstat': true, 'fstat': true,
+    '__system_property_get': true, '__system_property_read': true, 'system': true
+  };
+  if (typeof Module !== 'undefined' && typeof Module.findExportByName === 'function') {
+    var origFindExport = Module.findExportByName.bind(Module);
+    Module.findExportByName = function (moduleName, exportName) {
+      var addr = origFindExport(moduleName, exportName);
+      try {
+        var mod = moduleName ? ('' + moduleName).toLowerCase() : '';
+        var sym = '' + exportName;
+        if ((mod === '' || mod.indexOf('libc.so') !== -1) && unsafeLibcSymbols[sym] && addr) {
+          unsafeNativeAddrs[addr.toString()] = sym;
+        }
+      } catch (e) {}
+      return addr;
+    };
+  }
+  if (typeof Interceptor !== 'undefined' && typeof Interceptor.attach === 'function') {
+    var origAttach = Interceptor.attach.bind(Interceptor);
+    var attachedAddrs = {};
+    Interceptor.attach = function (target, callbacksOrProbe, data) {
+      try {
+        if (!target) return { detach: function () {} };
+        var key = target.toString();
+        if (key === '0x0' || key === '0' || unsafeNativeAddrs[key] || attachedAddrs[key]) {
+          return { detach: function () {} };
+        }
+        attachedAddrs[key] = true;
+        return origAttach(target, callbacksOrProbe, data);
+      } catch (e) {
+        return { detach: function () {} };
+      }
+    };
+  }
+
+  // 4. Protect ART on Android 14/15 (API 34/35):
+  //    - Block replacing methods on bootstrap core-oj classes (String, File,
+  //      UnixFileSystem, BufferedReader, Runtime, ProcessImpl, ProcessBuilder)
+  //      which ART & Frida invoke inside JNI transitions (causing recursion/SIGABRT).
+  //    - Guard against replacing the same method overload's `.implementation`
+  //      multiple times (which corrupts Frida's ART trampolines).
+  //    - Make Java.enumerateLoadedClassesSync() fast on large multi-dex apps.
+  //    - Ensure setTimeout/setImmediate callbacks run attached to the JVM via
+  //      Java.perform so scripts calling Java.use inside setTimeout do not crash.
+  if (typeof Java !== 'undefined' && typeof Java.perform === 'function') {
+    var origPerform = Java.perform.bind(Java);
+    globalThis.__bogusmipsOrigPerform = origPerform;
+    var origUse = Java.use.bind(Java);
+    var unsafeJavaClasses = {
+      'java.lang.String': true,
+      'java.io.File': true,
+      'java.io.UnixFileSystem': true,
+      'java.io.BufferedReader': true,
+      'java.lang.Runtime': true,
+      'java.lang.ProcessImpl': true,
+      'java.lang.ProcessBuilder': true,
+      'java.lang.ProcessManager': true
+    };
+    var hookedJavaOverloads = {};
+
+    function guardOverload(className, methodName, ov, sigKey, blockAll) {
+      if (!ov || ov.__bogusmipsGuarded) return ov;
+      try {
+        var origDesc = Object.getOwnPropertyDescriptor(ov, 'implementation')
+          || Object.getOwnPropertyDescriptor(Object.getPrototypeOf(ov), 'implementation');
+        if (origDesc && origDesc.set && origDesc.get) {
+          Object.defineProperty(ov, 'implementation', {
+            configurable: true,
+            get: function () { return origDesc.get.call(this); },
+            set: function (fn) {
+              if (blockAll) return;
+              var k = className + '#' + methodName + ':' + sigKey;
+              if (hookedJavaOverloads[k]) return;
+              hookedJavaOverloads[k] = true;
+              try { origDesc.set.call(this, fn); } catch (e) {}
             }
+          });
+        }
+        ov.__bogusmipsGuarded = true;
+      } catch (e) {}
+      return ov;
+    }
+
+    function guardMethod(className, methodName, m, blockAll) {
+      if (!m || m.__bogusmipsMethodGuarded) return m;
+      try {
+        guardOverload(className, methodName, m, 'default', blockAll);
+        if (Array.isArray(m.overloads)) {
+          m.overloads.forEach(function (ov, idx) {
+            guardOverload(className, methodName, ov, 'ov' + idx, blockAll);
+          });
+        }
+        if (typeof m.overload === 'function') {
+          var origOverload = m.overload.bind(m);
+          m.overload = function () {
+            var args = Array.prototype.slice.call(arguments);
+            var ov = origOverload.apply(m, args);
+            return guardOverload(className, methodName, ov, args.join(','), blockAll);
+          };
+        }
+        m.__bogusmipsMethodGuarded = true;
+      } catch (e) {}
+      return m;
+    }
+
+    Java.use = function (className) {
+      var name = '' + className;
+      var cls = origUse(name);
+      var blockAll = !!unsafeJavaClasses[name];
+      if (cls && typeof Proxy === 'function') {
+        return new Proxy(cls, {
+          get: function (target, prop, receiver) {
+            var val = Reflect.get(target, prop, receiver);
+            if (typeof prop === 'string' && val && (typeof val === 'function' || typeof val === 'object')) {
+              if (Array.isArray(val.overloads) || typeof val.overload === 'function') {
+                return guardMethod(name, prop, val, blockAll);
+              }
+            }
+            return val;
+          }
+        });
+      }
+      return cls;
+    };
+
+    Java.enumerateLoadedClassesSync = function () {
+      return [];
+    };
+
+    Java.perform = function (fn) {
+      var retryDelays = [1500, 2000, 2500];
+      var attempt = 0;
+      function tryPerform() {
+        try {
+          origPerform(function () {
+            globalThis.__bogusmipsArtReady = true;
+            try {
+              fn();
+            } catch (innerErr) {
+              console.log('[frida] ' + innerErr);
+            }
+          });
+        } catch (e) {
+          if (attempt < retryDelays.length) {
+            var d = retryDelays[attempt++];
+            origSetTimeout(tryPerform, d);
+          } else {
+            console.log('[frida] Java.perform failed: ' + e);
           }
         }
-        tryPerform();
+      }
+      tryPerform();
+    };
+
+    // Ensure setTimeout / setImmediate callbacks spawned by user scripts run
+    // attached to the JVM so direct Java.use(...) calls inside setTimeout work.
+    globalThis.setTimeout = function (cb, delay) {
+      var d = (typeof delay === 'number' && delay > 0) ? delay : 0;
+      return origSetTimeout(function () {
+        if (typeof cb !== 'function') return;
+        if (globalThis.__bogusmipsArtReady) {
+          Java.perform(cb);
+        } else {
+          try { cb(); } catch (e) { console.log('[frida] ' + e); }
+        }
+      }, d);
+    };
+    if (typeof origSetImmediate === 'function') {
+      globalThis.setImmediate = function (cb) {
+        return globalThis.setTimeout(cb, 0);
       };
     }
   }
@@ -619,7 +817,51 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
         for (spec, source) in user_scripts {
             let label = spec.replace('\\', "\\\\").replace('\'', "\\'");
             out.push_str(&format!(
-                "\n// --- Frida script: {spec} ---\nsetTimeout(function () {{\n  try {{\n    (function () {{\n{source}\n    }})();\n  }} catch (e) {{\n    console.log('[frida:{label}] ' + e);\n  }}\n}}, 2000);\n"
+                r#"
+// --- Frida script: {spec} ---
+(function () {{
+  var spec = '{label}';
+  var schedule = globalThis.__bogusmipsOrigSetTimeout || setTimeout;
+  var delays = [2000, 3500, 5500];
+  var attempt = 0;
+  function runScript() {{
+    try {{
+      var perform = globalThis.__bogusmipsOrigPerform
+        || ((typeof Java !== 'undefined' && Java.perform) ? Java.perform.bind(Java) : null);
+      if (perform) {{
+        perform(function () {{
+          globalThis.__bogusmipsArtReady = true;
+          console.log('[bogusmips:script:start] ' + spec);
+          try {{
+            (function () {{
+{source}
+            }})();
+            schedule(function () {{
+              console.log('[bogusmips:script:ok] ' + spec);
+            }}, 50);
+          }} catch (scriptErr) {{
+            console.log('[bogusmips:script:error] ' + spec + ' | ' + scriptErr);
+          }}
+        }});
+      }} else {{
+        console.log('[bogusmips:script:start] ' + spec);
+        (function () {{
+{source}
+        }})();
+        console.log('[bogusmips:script:ok] ' + spec);
+      }}
+    }} catch (artErr) {{
+      if (attempt < delays.length - 1) {{
+        attempt += 1;
+        schedule(runScript, delays[attempt] - delays[attempt - 1]);
+      }} else {{
+        console.log('[bogusmips:script:error] ' + spec + ' | ' + artErr);
+      }}
+    }}
+  }}
+  schedule(runScript, delays[0]);
+}})();
+"#
             ));
         }
     }

@@ -56,12 +56,28 @@ impl Phase {
     }
 }
 
+/// Live runtime state of an enabled Frida script during a capture session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptState {
+    /// Downloading or reading the script on the host.
+    Loading,
+    /// Pushed to the emulator and armed via `frida-gadget`; waiting for the app
+    /// to launch and initialize ART.
+    Injected,
+    /// Confirmed loaded and executing inside the target app (`messages` is the
+    /// number of log/send messages emitted by Frida).
+    Active { messages: usize },
+    /// Failed to load on the host or threw an exception in the app.
+    Error(String),
+}
+
 #[derive(Default)]
 pub struct Status {
     pub phase: Phase,
     pub log: Vec<(Instant, String)>,
     pub error: Option<String>,
     pub proxy_port: Option<u16>,
+    pub scripts: Vec<(String, ScriptState)>,
 }
 
 impl Status {
@@ -71,6 +87,70 @@ impl Status {
             let excess = self.log.len() - MAX_LOG;
             self.log.drain(0..excess);
         }
+    }
+
+    pub fn set_script_state(&mut self, spec: &str, state: ScriptState) {
+        if let Some((_, slot)) = self.scripts.iter_mut().find(|(s, _)| s == spec) {
+            *slot = state;
+        } else {
+            self.scripts.push((spec.to_owned(), state));
+        }
+    }
+
+    /// Processes one line from the `Frida` logcat tag, updating per-script
+    /// runtime state and recording user-visible output in [`Self::log`].
+    pub fn ingest_frida_line(&mut self, line: &str) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(spec) = trimmed.strip_prefix("[bogusmips:script:start]") {
+            let spec = spec.trim();
+            if !self
+                .scripts
+                .iter()
+                .any(|(s, st)| s == spec && matches!(st, ScriptState::Active { .. }))
+            {
+                self.set_script_state(spec, ScriptState::Injected);
+            }
+            return;
+        }
+        if let Some(spec) = trimmed.strip_prefix("[bogusmips:script:ok]") {
+            let spec = spec.trim();
+            let messages = self
+                .scripts
+                .iter()
+                .find(|(s, _)| s == spec)
+                .and_then(|(_, st)| match st {
+                    ScriptState::Active { messages } => Some(*messages),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            self.set_script_state(spec, ScriptState::Active { messages });
+            self.log(format!("✔ Frida script loaded & working: {spec}"));
+            return;
+        }
+        if let Some(rest) = trimmed.strip_prefix("[bogusmips:script:error]") {
+            let (spec, err) = rest
+                .split_once('|')
+                .map_or((rest.trim(), "script execution error"), |(s, e)| {
+                    (s.trim(), e.trim())
+                });
+            self.set_script_state(spec, ScriptState::Error(err.to_owned()));
+            self.log(format!("✖ Frida script error ({spec}): {err}"));
+            return;
+        }
+
+        // Any output emitted by the script in the target process confirms the
+        // script is running and increments its message counter.
+        for (_, state) in &mut self.scripts {
+            match state {
+                ScriptState::Injected => *state = ScriptState::Active { messages: 1 },
+                ScriptState::Active { messages } => *messages += 1,
+                ScriptState::Loading | ScriptState::Error(_) => {}
+            }
+        }
+        self.log(format!("[frida] {trimmed}"));
     }
 }
 
@@ -149,6 +229,17 @@ impl NetworkController {
             status.error.clone(),
             status.log.iter().map(|(_, m)| m.clone()).collect(),
         )
+    }
+
+    /// Live status of each Frida script configured for the current or last session.
+    pub fn script_statuses(&self) -> Vec<(String, ScriptState)> {
+        self.status.lock().unwrap().scripts.clone()
+    }
+
+    /// Processes a Frida log line, updating per-script runtime status and the
+    /// session log.
+    pub fn record_frida_line(&self, line: &str) {
+        self.status.lock().unwrap().ingest_frida_line(line);
     }
 
     pub fn start(&mut self, config: StartConfig) {
@@ -276,6 +367,12 @@ fn run_session(
     if let Some(package) = &config.package {
         if needs_frida {
             let install_frida = || -> Result<String, String> {
+                {
+                    let mut s = status.lock().unwrap();
+                    for spec in &config.frida_scripts {
+                        s.set_script_state(spec, ScriptState::Loading);
+                    }
+                }
                 let abi = emulator.device_abi()?;
                 let frida_abi = bypass::frida_abi(&abi)
                     .ok_or_else(|| format!("no frida gadget for this device ABI ({abi})"))?;
@@ -291,11 +388,29 @@ fn run_session(
                         .lock()
                         .unwrap()
                         .log(format!("Loading Frida script {spec}…"));
-                    loaded.push(bypass::load_script(&cache, spec)?);
+                    match bypass::load_script(&cache, spec) {
+                        Ok((canonical, js)) => {
+                            loaded.push((canonical, js));
+                        }
+                        Err(e) => {
+                            status
+                                .lock()
+                                .unwrap()
+                                .set_script_state(spec, ScriptState::Error(e.clone()));
+                            return Err(e);
+                        }
+                    }
                 }
                 let combined = bypass::build_gadget_script(config.bypass_checks, &loaded);
                 emulator.clear_logcat();
-                emulator.install_frida_script(&gadget, package, &combined)
+                let res = emulator.install_frida_script(&gadget, package, &combined)?;
+                {
+                    let mut s = status.lock().unwrap();
+                    for (canonical, _) in &loaded {
+                        s.set_script_state(canonical, ScriptState::Injected);
+                    }
+                }
+                Ok(res)
             };
             let label = match (config.bypass_checks, config.frida_scripts.len()) {
                 (true, 0) => "Bypassing Play Services and root checks".to_owned(),
@@ -315,12 +430,12 @@ fn run_session(
     while !is_cancelled() {
         std::thread::sleep(Duration::from_millis(200));
         tick = tick.wrapping_add(1);
-        if needs_frida && tick % 5 == 0 {
+        if needs_frida && tick % 3 == 0 {
             let lines = emulator.frida_log_lines();
             if lines.len() > frida_seen {
                 let mut s = status.lock().unwrap();
                 for line in &lines[frida_seen..] {
-                    s.log(format!("[frida] {line}"));
+                    s.ingest_frida_line(line);
                 }
                 frida_seen = lines.len();
             }
@@ -377,5 +492,23 @@ mod tests {
         let controller = NetworkController::new();
         assert!(controller.ca_pem().contains("BEGIN CERTIFICATE"));
         assert!(controller.capture().is_empty());
+    }
+
+    #[test]
+    fn ingests_frida_status_markers_and_messages() {
+        let mut status = Status::default();
+        let spec = "fdciabdul/frida-multiple-bypass";
+        status.set_script_state(spec, ScriptState::Loading);
+        status.ingest_frida_line(&format!("[bogusmips:script:start] {spec}"));
+        assert_eq!(status.scripts[0].1, ScriptState::Injected);
+
+        status.ingest_frida_line("[+] SSLContext");
+        assert_eq!(status.scripts[0].1, ScriptState::Active { messages: 1 });
+
+        status.ingest_frida_line(&format!("[bogusmips:script:ok] {spec}"));
+        assert_eq!(status.scripts[0].1, ScriptState::Active { messages: 1 });
+
+        status.ingest_frida_line("Unpinning setup completed");
+        assert_eq!(status.scripts[0].1, ScriptState::Active { messages: 2 });
     }
 }

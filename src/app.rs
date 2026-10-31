@@ -885,6 +885,12 @@ impl BogusMipsApp {
         if avd.is_empty() {
             return;
         }
+        // Clean up any previous session's temp directory *before* extracting the
+        // APKs for the new session so we never delete the newly extracted files.
+        doc.net.stop();
+        if let Some(dir) = doc.net_tempdir.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         match build_start_config(
             &doc.package,
             avd,
@@ -892,9 +898,7 @@ impl BogusMipsApp {
             doc.net_view.enabled_scripts(),
         ) {
             Ok((config, tempdir)) => {
-                if let Some(dir) = doc.net_tempdir.replace(tempdir) {
-                    let _ = std::fs::remove_dir_all(dir);
-                }
+                doc.net_tempdir = Some(tempdir);
                 doc.net.start(config);
             }
             Err(e) => self.error = Some(("Could not start capture", e)),
@@ -1013,10 +1017,14 @@ fn build_start_config(
     frida_scripts: Vec<String>,
 ) -> Result<(StartConfig, PathBuf), String> {
     use crate::package::PackageKind;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+    let seq = NEXT_SESSION.fetch_add(1, Ordering::Relaxed);
     let tempdir = std::env::temp_dir().join(format!(
-        "bogusmips-net-{}-{}",
+        "bogusmips-net-{}-{}-{}",
         std::process::id(),
-        package.archives.first().map_or(0, |a| a.size)
+        package.archives.first().map_or(0, |a| a.size),
+        seq,
     ));
     std::fs::create_dir_all(&tempdir).map_err(|e| e.to_string())?;
 
@@ -1814,6 +1822,48 @@ mod tests {
         });
         let doc = app.document.as_ref().unwrap();
         assert_eq!(doc.net_view.enabled_scripts(), vec!["/tmp/custom_hook.js"]);
+
+        // Simulate Frida gadget reporting that the script loaded and emitted messages;
+        // verify UI renders live status feedback ("✔ Working (1)" and summary banner).
+        doc.net
+            .record_frida_line("[bogusmips:script:start] /tmp/custom_hook.js");
+        doc.net.record_frida_line("[+] SSLContext");
+        doc.net
+            .record_frida_line("[bogusmips:script:ok] /tmp/custom_hook.js");
+        let texts = texts_of(&ctx.run(input(vec![]), |ctx| app.ui(ctx)));
+        assert!(
+            texts.iter().any(|(_, t)| t.contains("✔ Working (1)")),
+            "expected '✔ Working (1)' badge in UI: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|(_, t)| t.contains("✔ Frida: /tmp/custom_hook.js loaded & working")),
+            "expected Frida working summary in UI: {texts:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_xapk_start_configs_use_distinct_temp_dirs() {
+        let inner_apk = crate::formats::zip::write_stored_zip(&[("classes.dex", b"dex")]);
+        let xapk = crate::formats::zip::write_stored_zip(&[
+            ("manifest.json", br#"{"package_name":"com.example.app"}"#),
+            ("base.apk", &inner_apk),
+            ("config.arm64_v8a.apk", &inner_apk),
+        ]);
+        let package = Package::from_bytes(Path::new("app.xapk"), xapk.into()).unwrap();
+        let (_cfg1, dir1) =
+            build_start_config(&package, "avd".into(), false, vec![]).unwrap();
+        let (cfg2, dir2) =
+            build_start_config(&package, "avd".into(), false, vec![]).unwrap();
+        assert_ne!(dir1, dir2);
+        // Removing the first session's temp dir must leave the second session's APKs intact.
+        std::fs::remove_dir_all(&dir1).unwrap();
+        for apk in &cfg2.apks {
+            assert!(apk.exists(), "expected {} to exist", apk.display());
+        }
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]

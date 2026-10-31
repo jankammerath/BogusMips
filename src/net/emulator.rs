@@ -222,6 +222,19 @@ pub struct Emulator {
 impl Emulator {
     /// Starts `avd` through the proxy. Does not wait for boot.
     pub fn start(sdk: &Sdk, avd: &str, proxy_port: u16) -> Result<Emulator, String> {
+        // If no emulator is currently connected, remove any stale AVD lock
+        // files left behind by an earlier crash or SIGKILL so the emulator
+        // does not abort on startup.
+        let any_running = run(&sdk.adb(), &["devices"])
+            .map(|out| {
+                out.lines()
+                    .any(|l| l.starts_with("emulator-") && l.contains("\tdevice"))
+            })
+            .unwrap_or(false);
+        if !any_running {
+            clean_stale_avd_locks(avd);
+        }
+
         let child = Command::new(sdk.emulator())
             .args(emulator_args(avd, proxy_port))
             .stdout(Stdio::null())
@@ -256,6 +269,13 @@ impl Emulator {
             if Instant::now() > deadline {
                 return Err("timed out waiting for the emulator to appear".into());
             }
+            if let Some(child) = &mut self.child {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!(
+                        "the emulator process exited early ({status}); check that no other instance of this AVD is running"
+                    ));
+                }
+            }
             if let Ok(list) = run(&self.sdk.adb(), &["devices"]) {
                 if let Some(serial) = list
                     .lines()
@@ -270,6 +290,11 @@ impl Emulator {
         while Instant::now() < deadline {
             if cancel() {
                 return Err("cancelled".into());
+            }
+            if let Some(child) = &mut self.child {
+                if let Ok(Some(status)) = child.try_wait() {
+                    return Err(format!("the emulator exited while booting ({status})"));
+                }
             }
             if let Ok(out) = self.adb(&["shell", "getprop", "sys.boot_completed"]) {
                 if out.trim() == "1" {
@@ -426,6 +451,7 @@ impl Emulator {
         let value = format!("LD_PRELOAD={GADGET}");
         self.adb(&["shell", "setprop", &prop, &value])
             .map_err(|e| format!("could not arm the bypass (setprop {prop}): {e}"))?;
+        let _ = self.adb(&["shell", "am", "force-stop", package]);
         Ok("Frida gadget armed".into())
     }
 
@@ -454,10 +480,32 @@ impl Drop for Emulator {
         self.clear_proxy();
         if let Some(mut child) = self.child.take() {
             let _ = self.adb(&["emu", "kill"]);
-            // Give it a moment, then ensure the process is gone.
-            std::thread::sleep(Duration::from_millis(300));
+            // Give QEMU up to ~3s to shut down cleanly and release AVD lock
+            // files before sending SIGKILL.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Ok(Some(_)) = child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
             let _ = child.kill();
+            let _ = child.wait();
         }
+    }
+}
+
+fn clean_stale_avd_locks(avd: &str) {
+    let Some(cfg_path) = avd_config_path(avd) else {
+        return;
+    };
+    let Some(avd_dir) = cfg_path.parent() else {
+        return;
+    };
+    for lock in ["hardware-qemu.ini.lock", "multiinstance.lock"] {
+        let p = avd_dir.join(lock);
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
     }
 }
 
