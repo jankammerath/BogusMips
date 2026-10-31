@@ -1,7 +1,7 @@
 //! Developer tool: runs a full Network capture session headlessly, for
 //! validating the emulator + proxy orchestration end-to-end.
 //!
-//! Usage: cargo run --example net_capture -- <app.apk|app.xapk> <AVD> [seconds] [--bypass] [--codeshare <owner/slug>] [--script <path_or_slug>]
+//! Usage: cargo run --example net_capture -- <app.apk|app.xapk> <AVD> [seconds] [--codeshare <owner/slug>] [--script <path_or_slug>]
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -13,16 +13,13 @@ use bogusmips::package::{Package, PackageKind};
 
 fn main() {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
-    let mut bypass_checks = false;
     let mut frida_scripts = Vec::new();
     let mut positional = Vec::new();
 
     let mut i = 0;
     while i < raw_args.len() {
         let arg = &raw_args[i];
-        if arg == "--bypass" || arg == "bypass" {
-            bypass_checks = true;
-        } else if let Some(val) = arg
+        if let Some(val) = arg
             .strip_prefix("--codeshare=")
             .or_else(|| arg.strip_prefix("--script="))
         {
@@ -51,7 +48,7 @@ fn main() {
     let mut positional = positional.into_iter();
     let (Some(input), Some(avd)) = (positional.next(), positional.next()) else {
         eprintln!(
-            "usage: net_capture <app.apk|xapk> <AVD> [seconds] [--bypass] [--codeshare <owner/slug>] [--script <path_or_slug>]"
+            "usage: net_capture <app.apk|xapk> <AVD> [seconds] [--codeshare <owner/slug>] [--script <path_or_slug>]"
         );
         std::process::exit(2);
     };
@@ -92,7 +89,6 @@ fn main() {
         avd,
         apks,
         package: package_name,
-        bypass_checks,
         frida_scripts,
     });
 

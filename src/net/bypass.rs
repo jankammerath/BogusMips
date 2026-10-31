@@ -1,22 +1,11 @@
-//! Optional Play Services availability / root-detection bypass and user-defined
-//! Frida scripts (including Frida CodeShare `owner/slug` scripts such as
-//! `dzonerzy/aesinfo`, local `.js` files, and `http(s)://` script URLs).
+//! User-defined Frida scripts (including Frida CodeShare `owner/slug` scripts
+//! such as `dzonerzy/aesinfo` or `fdciabdul/frida-multiple-bypass`, local `.js`
+//! files, and `http(s)://` script URLs).
 //!
-//! Rootable `google_apis` emulators carry an older Google Play Services build
-//! than many apps are compiled against (so `GoogleApiAvailability` returns
-//! `SERVICE_VERSION_UPDATE_REQUIRED`), and their `userdebug` build looks rooted
-//! to apps (`ro.debuggable=1`, `test-keys`, RootBeer, …). Either makes an app
-//! abort before producing any traffic. To keep such apps running during a
-//! capture — and to let users run custom instrumentation such as
-//! `frida --codeshare dzonerzy/aesinfo` — we inject
-//! [frida-gadget](https://frida.re/docs/gadget/) into the target app via the
-//! `wrap.<package>` property (`LD_PRELOAD`), so no frida tooling is needed on
-//! the host or a frida-server on the device.
-//!
-//! The built-in bypass only makes the checks pass — it does not provide the
-//! services or un-root the device — which is all that is needed to keep these
-//! environment checks from blocking network analysis. It cannot defeat
-//! server-side attestation such as the Play Integrity API.
+//! To let users run custom Frida instrumentation during a network capture
+//! without needing `frida` CLI tooling on the host or `frida-server` on the
+//! device, we inject [frida-gadget](https://frida.re/docs/gadget/) into the
+//! target app via the `wrap.<package>` property (`LD_PRELOAD`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -24,10 +13,10 @@ use std::process::{Command, Stdio};
 use crate::agent::json::JsonValue;
 
 /// frida release whose gadget is downloaded. Pinned to the last 16.x, because
-/// 17.x removed the built-in `Java`/`ObjC` script globals this bypass relies
-/// on (they became ES-module imports needing a bundler). Override with the
-/// `BOGUSMIPS_FRIDA_VERSION` environment variable, e.g. to match a device's
-/// Android version.
+/// 17.x removed the built-in `Java`/`ObjC` script globals that existing
+/// CodeShare scripts rely on (they became ES-module imports needing a bundler).
+/// Override with the `BOGUSMIPS_FRIDA_VERSION` environment variable, e.g. to
+/// match a device's Android version.
 pub const FRIDA_VERSION: &str = "16.7.19";
 
 /// The frida version to download — [`FRIDA_VERSION`] unless overridden by the
@@ -37,99 +26,6 @@ pub fn frida_version() -> String {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| FRIDA_VERSION.to_owned())
-}
-
-/// The frida script the gadget runs before the app's entry point. It forces
-/// the common Play Services availability checks to return
-/// `ConnectionResult.SUCCESS` (0) and makes the common root-detection checks
-/// report an unrooted device.
-pub fn bypass_script() -> &'static str {
-    r#"(function () {
-  // Remember what we've already hooked so re-applying never re-replaces an
-  // implementation (repeated replacement destabilises frida's trampolines).
-  var hooked = {};
-  function hookReturn(className, method, value) {
-    var key = className + '#' + method;
-    if (hooked[key]) return;
-    try {
-      var cls = Java.use(className);
-      if (!cls[method]) return;
-      cls[method].overloads.forEach(function (ov) {
-        ov.implementation = function () { return value; };
-      });
-      hooked[key] = true;
-    } catch (e) {
-      // Class or method not present / not loaded yet; a later pass may catch it.
-    }
-  }
-
-  var buildDone = false;
-  var propsDone = false;
-  function applyHooks() {
-    // --- Google Play Services availability -> ConnectionResult.SUCCESS (0) ---
-    ['com.google.android.gms.common.GoogleApiAvailability',
-     'com.google.android.gms.common.GoogleApiAvailabilityLight',
-     'com.google.android.gms.common.GooglePlayServicesUtil',
-     'com.google.android.gms.common.GooglePlayServicesUtilLight'].forEach(function (c) {
-      hookReturn(c, 'isGooglePlayServicesAvailable', 0);
-    });
-
-    // --- RootBeer: every detection method reports "not rooted" (this also
-    // covers su-binary/busybox/magisk probes, so we avoid the crash-prone
-    // global File.exists / Runtime.exec overrides). ---
-    ['isRooted', 'isRootedWithBusyBoxCheck', 'isRootedWithoutBusyBoxCheck',
-     'detectRootManagementApps', 'detectPotentiallyDangerousApps', 'detectRootCloakingApps',
-     'detectTestKeys', 'checkForBusyBoxBinary', 'checkForSuBinary', 'checkSuExists',
-     'checkForRWPaths', 'checkForDangerousProps', 'checkForRootNative',
-     'checkForMagiskBinary', 'checkForBinary'].forEach(function (m) {
-      hookReturn('com.scottyab.rootbeer.RootBeer', m, false);
-    });
-
-    // --- Build fingerprint: hide the userdebug test-keys tag ---
-    if (!buildDone) {
-      try { Java.use('android.os.Build').TAGS.value = 'release-keys'; buildDone = true; } catch (e) {}
-    }
-
-    // --- Dangerous system properties report safe values ---
-    if (!propsDone) {
-      try {
-        var SystemProperties = Java.use('android.os.SystemProperties');
-        var safe = { 'ro.debuggable': '0', 'ro.secure': '1', 'service.adb.root': '0',
-                     'ro.build.tags': 'release-keys', 'ro.build.type': 'user',
-                     'ro.build.selinux': '1' };
-        SystemProperties.get.overload('java.lang.String').implementation = function (key) {
-          var k = '' + key;
-          if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
-          return this.get(key);
-        };
-        SystemProperties.get.overload('java.lang.String', 'java.lang.String').implementation = function (key, def) {
-          var k = '' + key;
-          if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
-          return this.get(key, def);
-        };
-        propsDone = true;
-      } catch (e) {}
-    }
-  }
-
-  // The gadget is loaded via LD_PRELOAD before ART is initialised. Using the
-  // Java bridge too early aborts the process ("system_class_loader_ == nullptr
-  // implies IsAotCompiler"), and polling Java.available in a tight loop starves
-  // frida's own initialisation, so we simply defer with a few gently-spaced
-  // one-shot timers starting safely after ART is up (~1.5s). Re-applying is
-  // idempotent and catches classes (e.g. RootBeer) loaded a little later.
-  // NOTE: checks that run during very early app startup (before ~1.5s) can
-  // still win this race; beating those reliably needs frida spawn-gating.
-  var delays = [2000, 3500, 5500, 8000];
-  var i = 0;
-  function schedule() {
-    try { Java.perform(applyHooks); } catch (e) { /* ART not ready yet */ }
-    i += 1;
-    if (i < delays.length) setTimeout(schedule, delays[i] - delays[i - 1]);
-  }
-  setTimeout(schedule, delays[0]);
-})();
-"#
 }
 
 /// The gadget configuration (Script interaction) that auto-loads `script_path`.
@@ -217,11 +113,10 @@ impl FridaScriptEntry {
     }
 }
 
-/// Persisted Frida configuration (the built-in bypass toggle and user-defined
-/// scripts with their enabled/disabled state).
+/// Persisted Frida configuration (user-defined scripts with their
+/// enabled/disabled state).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FridaConfig {
-    pub bypass_checks: bool,
     pub scripts: Vec<FridaScriptEntry>,
 }
 
@@ -233,17 +128,11 @@ impl FridaConfig {
                 ("enabled", JsonValue::Bool(s.enabled)),
             ])
         });
-        JsonValue::obj([
-            ("bypass_checks", JsonValue::Bool(self.bypass_checks)),
-            ("scripts", JsonValue::arr(scripts)),
-        ])
+        JsonValue::obj([("scripts", JsonValue::arr(scripts))])
     }
 
     pub fn from_json(val: &JsonValue) -> Self {
         let mut cfg = Self::default();
-        if let Some(b) = val.get("bypass_checks").and_then(JsonValue::as_bool) {
-            cfg.bypass_checks = b;
-        }
         if let Some(arr) = val.get("scripts").and_then(JsonValue::as_array) {
             for item in arr {
                 if let Some(spec) = item.get("spec").and_then(JsonValue::as_str) {
@@ -555,56 +444,103 @@ pub fn load_script(cache_dir: &Path, spec: &str) -> Result<(String, String), Str
     }
 }
 
-/// Assembles the single JavaScript payload executed by `frida-gadget`:
-/// - When `bypass_checks` is `true`, includes [`bypass_script`].
-/// - When `user_scripts` (`(spec, js_source)`) is non-empty, installs a
-///   compatibility and safety shim for Frida CodeShare scripts (such as
-///   `dzonerzy/aesinfo` and `fdciabdul/frida-multiple-bypass`):
-///   1. Forwards `send(...)` messages to `console.log` so output appears in
-///      `logcat` and the BogusMips Network log without a Frida TCP client.
-///   2. Polyfills legacy Frida 12 `Memory.readCString` / `readUtf8String` /
-///      `writeUtf8String` APIs and guards `Interceptor.attach` against hooking
-///      `libc.so` `fopen`/`access`/`__system_property_get`/`system` (which
-///      corrupt `.rodata` or deadlock `frida-gadget` on Android 14/15).
-///   3. Protects ART bootstrap classes (`java.lang.String`, `java.io.File`,
-///      `java.io.UnixFileSystem`, `java.io.BufferedReader`, `java.lang.Runtime`,
-///      `java.lang.ProcessImpl`, `java.lang.ProcessBuilder`) and prevents
-///      repeated `.implementation` replacement on the same method overload from
-///      corrupting ART trampolines.
-///   4. Runs `setTimeout` callbacks and each user script inside `Java.perform`
-///      once ART is initialized (~2s after `LD_PRELOAD`), emitting structured
-///      `[bogusmips:script:start|ok|error]` status markers for the UI.
-pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)]) -> String {
-    if bypass_checks && user_scripts.is_empty() {
-        return bypass_script().to_owned();
+/// Logcat tag written by the gadget wrapper via `liblog.so`'s
+/// `__android_log_write` so output from autonomous `frida-gadget` scripts is
+/// reliably captured by `adb logcat` without a host Frida client.
+pub const FRIDA_LOGCAT_TAG: &str = "BogusMipsFrida";
+
+/// Assembles the JavaScript payload executed by `frida-gadget` for the enabled
+/// `user_scripts` (`(spec, js_source)`):
+/// 1. Bridges `console.log` / `console.warn` / `console.error` / `send(...)`
+///    directly to Android's `liblog.so` (`__android_log_write` with tag
+///    [`FRIDA_LOGCAT_TAG`]), because autonomous `frida-gadget` in `"script"`
+///    interaction mode does not forward `console.log` to `logcat` on its own.
+/// 2. Polyfills legacy Frida 12 `Memory.readCString` / `readUtf8String` /
+///    `writeUtf8String` APIs and guards `Interceptor.attach` against hooking
+///    `libc.so` `fopen`/`access`/`__system_property_get`/`system` (which
+///    corrupt `.rodata` or deadlock `frida-gadget` on Android 14/15).
+/// 3. Avoids touching `globalThis.Java` during `LD_PRELOAD` (`t = 0ms`, before
+///    ART exists, which would break `frida-java-bridge`'s lazy initialization).
+///    Once ART is up (~2s after launch), installs in-place guards on bootstrap
+///    classes (`java.lang.String`, `java.io.File`, `java.io.UnixFileSystem`,
+///    `java.io.BufferedReader`, `java.lang.Runtime`, `java.lang.ProcessImpl`,
+///    `java.lang.ProcessBuilder`) and `ApplicationPackageManager.getPackageInfo`
+///    without wrapping class handles in ES6 `Proxy` objects, then runs each user
+///    script inside `Java.perform`, emitting `[bogusmips:script:start|ok|error]`
+///    status markers.
+pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
+    if user_scripts.is_empty() {
+        return String::new();
     }
 
-    let mut out = String::new();
-    if bypass_checks {
-        out.push_str(bypass_script());
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-
-    if !user_scripts.is_empty() {
-        out.push_str(
-            r#"(function () {
+    let mut out = String::from(
+        r#"(function () {
   if (typeof globalThis.__bogusmipsWrapped !== 'undefined') return;
   globalThis.__bogusmipsWrapped = true;
   var origSetTimeout = globalThis.setTimeout;
   var origSetImmediate = globalThis.setImmediate;
-  globalThis.__bogusmipsOrigSetTimeout = origSetTimeout;
-  globalThis.__bogusmipsArtReady = false;
 
-  // 1. Forward send(...) to console.log so CodeShare scripts using send()
-  //    appear in logcat and the Network view.
+  // 1. Bridge console.log / warn / error / send directly to Android logcat via
+  //    liblog.so (__android_log_write), since frida-gadget in autonomous
+  //    "script" mode does not route console.log to logcat without a client.
+  var logWrite = null;
+  var logTag = null;
+  try {
+    var findExp = (typeof Module !== 'undefined' && Module.findExportByName)
+      ? Module.findExportByName.bind(Module)
+      : null;
+    if (findExp) {
+      var logAddr = findExp('liblog.so', '__android_log_write')
+        || findExp(null, '__android_log_write');
+      if (logAddr) {
+        logWrite = new NativeFunction(logAddr, 'int', ['int', 'pointer', 'pointer']);
+        logTag = Memory.allocUtf8String('BogusMipsFrida');
+      }
+    }
+  } catch (e) {}
+
+  function writeLogcat(msg) {
+    if (!logWrite || !logTag) return;
+    try {
+      var s = Memory.allocUtf8String('' + msg);
+      logWrite(4, logTag, s);
+    } catch (e) {}
+  }
+
+  function formatArgs(args) {
+    var parts = [];
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (typeof a === 'string') parts.push(a);
+      else if (a instanceof Error) parts.push(a.message || ('' + a));
+      else {
+        try { parts.push(JSON.stringify(a)); } catch (e) { parts.push('' + a); }
+      }
+    }
+    return parts.join(' ');
+  }
+
+  var origConsoleLog = console.log ? console.log.bind(console) : function () {};
+  var origConsoleWarn = console.warn ? console.warn.bind(console) : origConsoleLog;
+  var origConsoleError = console.error ? console.error.bind(console) : origConsoleLog;
+  console.log = function () {
+    writeLogcat(formatArgs(arguments));
+    try { origConsoleLog.apply(console, arguments); } catch (e) {}
+  };
+  console.warn = function () {
+    writeLogcat(formatArgs(arguments));
+    try { origConsoleWarn.apply(console, arguments); } catch (e) {}
+  };
+  console.error = function () {
+    writeLogcat(formatArgs(arguments));
+    try { origConsoleError.apply(console, arguments); } catch (e) {}
+  };
   if (typeof send === 'function') {
     var origSend = send;
     globalThis.send = function (message, data) {
       try {
         var text = (typeof message === 'string') ? message : JSON.stringify(message);
-        console.log(text);
+        writeLogcat(text);
       } catch (e) {}
       try { return origSend(message, data); } catch (e) {}
     };
@@ -672,28 +608,29 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
     };
   }
 
-  // 4. Protect ART on Android 14/15 (API 34/35):
-  //    - Block replacing methods on bootstrap core-oj classes (String, File,
-  //      UnixFileSystem, BufferedReader, Runtime, ProcessImpl, ProcessBuilder)
-  //      which ART & Frida invoke inside JNI transitions (causing recursion/SIGABRT).
-  //    - Guard against replacing the same method overload's `.implementation`
-  //      multiple times (which corrupts Frida's ART trampolines).
-  //    - Make Java.enumerateLoadedClassesSync() fast on large multi-dex apps.
-  //    - Ensure setTimeout/setImmediate callbacks run attached to the JVM via
-  //      Java.perform so scripts calling Java.use inside setTimeout do not crash.
-  if (typeof Java !== 'undefined' && typeof Java.perform === 'function') {
-    var origPerform = Java.perform.bind(Java);
-    globalThis.__bogusmipsOrigPerform = origPerform;
+  // 4. Do NOT touch `Java` at t = 0ms (during LD_PRELOAD, before ART is
+  //    initialised), because accessing any property on `Java` triggers
+  //    frida-java-bridge's lazy initialisation prematurely and breaks it.
+  var shimsInstalled = false;
+  var origPerform = null;
+
+  function installJavaShims() {
+    if (shimsInstalled) return;
+    shimsInstalled = true;
+    origPerform = Java.perform.bind(Java);
     var origUse = Java.use.bind(Java);
-    var unsafeJavaClasses = {
-      'java.lang.String': true,
-      'java.io.File': true,
-      'java.io.UnixFileSystem': true,
-      'java.io.BufferedReader': true,
-      'java.lang.Runtime': true,
-      'java.lang.ProcessImpl': true,
-      'java.lang.ProcessBuilder': true,
-      'java.lang.ProcessManager': true
+
+    // Bootstrap methods whose ART trampolines cause infinite recursion or
+    // SIGABRT when replaced on Android 14/15 (API 34/35).
+    var unsafeClassMethods = {
+      'java.lang.String': ['contains'],
+      'java.io.File': ['exists'],
+      'java.io.UnixFileSystem': ['checkAccess'],
+      'java.io.BufferedReader': ['readLine'],
+      'java.lang.Runtime': ['exec'],
+      'java.lang.ProcessImpl': ['start'],
+      'java.lang.ProcessBuilder': ['start'],
+      'java.lang.ProcessManager': ['exec']
     };
     var hookedJavaOverloads = {};
 
@@ -720,9 +657,10 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
       return ov;
     }
 
-    function guardMethod(className, methodName, m, blockAll) {
-      if (!m || m.__bogusmipsMethodGuarded) return m;
+    function guardMethodOnClass(cls, className, methodName, blockAll) {
       try {
+        var m = cls[methodName];
+        if (!m || m.__bogusmipsMethodGuarded) return;
         guardOverload(className, methodName, m, 'default', blockAll);
         if (Array.isArray(m.overloads)) {
           m.overloads.forEach(function (ov, idx) {
@@ -739,25 +677,19 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
         }
         m.__bogusmipsMethodGuarded = true;
       } catch (e) {}
-      return m;
     }
 
     Java.use = function (className) {
       var name = '' + className;
       var cls = origUse(name);
-      var blockAll = !!unsafeJavaClasses[name];
-      if (cls && typeof Proxy === 'function') {
-        return new Proxy(cls, {
-          get: function (target, prop, receiver) {
-            var val = Reflect.get(target, prop, receiver);
-            if (typeof prop === 'string' && val && (typeof val === 'function' || typeof val === 'object')) {
-              if (Array.isArray(val.overloads) || typeof val.overload === 'function') {
-                return guardMethod(name, prop, val, blockAll);
-              }
-            }
-            return val;
-          }
-        });
+      if (!cls) return cls;
+      var blocked = unsafeClassMethods[name];
+      if (blocked) {
+        for (var i = 0; i < blocked.length; i++) {
+          guardMethodOnClass(cls, name, blocked[i], true);
+        }
+      } else if (name === 'android.app.ApplicationPackageManager') {
+        guardMethodOnClass(cls, name, 'getPackageInfo', false);
       }
       return cls;
     };
@@ -767,41 +699,24 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
     };
 
     Java.perform = function (fn) {
-      var retryDelays = [1500, 2000, 2500];
-      var attempt = 0;
-      function tryPerform() {
-        try {
-          origPerform(function () {
-            globalThis.__bogusmipsArtReady = true;
-            try {
-              fn();
-            } catch (innerErr) {
-              console.log('[frida] ' + innerErr);
-            }
-          });
-        } catch (e) {
-          if (attempt < retryDelays.length) {
-            var d = retryDelays[attempt++];
-            origSetTimeout(tryPerform, d);
-          } else {
-            console.log('[frida] Java.perform failed: ' + e);
+      try {
+        origPerform(function () {
+          try {
+            fn();
+          } catch (innerErr) {
+            console.log('[frida] ' + innerErr);
           }
-        }
+        });
+      } catch (e) {
+        console.log('[frida] ' + e);
       }
-      tryPerform();
     };
 
-    // Ensure setTimeout / setImmediate callbacks spawned by user scripts run
-    // attached to the JVM so direct Java.use(...) calls inside setTimeout work.
     globalThis.setTimeout = function (cb, delay) {
       var d = (typeof delay === 'number' && delay > 0) ? delay : 0;
       return origSetTimeout(function () {
         if (typeof cb !== 'function') return;
-        if (globalThis.__bogusmipsArtReady) {
-          Java.perform(cb);
-        } else {
-          try { cb(); } catch (e) { console.log('[frida] ' + e); }
-        }
+        Java.perform(cb);
       }, d);
     };
     if (typeof origSetImmediate === 'function') {
@@ -810,61 +725,59 @@ pub fn build_gadget_script(bypass_checks: bool, user_scripts: &[(String, String)
       };
     }
   }
+
+  var scripts = [
+"#,
+    );
+
+    for (spec, source) in user_scripts {
+        let label = spec.replace('\\', "\\\\").replace('\'', "\\'");
+        out.push_str(&format!(
+            r#"    {{
+      spec: '{label}',
+      run: function () {{
+{source}
+      }}
+    }},
+"#
+        ));
+    }
+
+    out.push_str(
+        r#"  ];
+
+  var delays = [2000, 3500, 5500, 8000];
+  var attempt = 0;
+  function bootAfterArt() {
+    try {
+      Java.perform(function () {
+        installJavaShims();
+        for (var i = 0; i < scripts.length; i++) {
+          var s = scripts[i];
+          console.log('[bogusmips:script:start] ' + s.spec);
+          try {
+            s.run();
+            console.log('[bogusmips:script:ok] ' + s.spec);
+          } catch (scriptErr) {
+            console.log('[bogusmips:script:error] ' + s.spec + ' | ' + scriptErr);
+          }
+        }
+      });
+    } catch (artErr) {
+      attempt += 1;
+      if (attempt < delays.length) {
+        origSetTimeout(bootAfterArt, delays[attempt] - delays[attempt - 1]);
+      } else {
+        for (var j = 0; j < scripts.length; j++) {
+          console.log('[bogusmips:script:error] ' + scripts[j].spec + ' | ' + artErr);
+        }
+      }
+    }
+  }
+  origSetTimeout(bootAfterArt, delays[0]);
 })();
 "#,
-        );
-
-        for (spec, source) in user_scripts {
-            let label = spec.replace('\\', "\\\\").replace('\'', "\\'");
-            out.push_str(&format!(
-                r#"
-// --- Frida script: {spec} ---
-(function () {{
-  var spec = '{label}';
-  var schedule = globalThis.__bogusmipsOrigSetTimeout || setTimeout;
-  var delays = [2000, 3500, 5500];
-  var attempt = 0;
-  function runScript() {{
-    try {{
-      var perform = globalThis.__bogusmipsOrigPerform
-        || ((typeof Java !== 'undefined' && Java.perform) ? Java.perform.bind(Java) : null);
-      if (perform) {{
-        perform(function () {{
-          globalThis.__bogusmipsArtReady = true;
-          console.log('[bogusmips:script:start] ' + spec);
-          try {{
-            (function () {{
-{source}
-            }})();
-            schedule(function () {{
-              console.log('[bogusmips:script:ok] ' + spec);
-            }}, 50);
-          }} catch (scriptErr) {{
-            console.log('[bogusmips:script:error] ' + spec + ' | ' + scriptErr);
-          }}
-        }});
-      }} else {{
-        console.log('[bogusmips:script:start] ' + spec);
-        (function () {{
-{source}
-        }})();
-        console.log('[bogusmips:script:ok] ' + spec);
-      }}
-    }} catch (artErr) {{
-      if (attempt < delays.length - 1) {{
-        attempt += 1;
-        schedule(runScript, delays[attempt] - delays[attempt - 1]);
-      }} else {{
-        console.log('[bogusmips:script:error] ' + spec + ' | ' + artErr);
-      }}
-    }}
-  }}
-  schedule(runScript, delays[0]);
-}})();
-"#
-            ));
-        }
-    }
+    );
 
     out
 }
@@ -893,18 +806,6 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn script_forces_success_and_hides_root() {
-        let s = bypass_script();
-        assert!(s.contains("com.google.android.gms.common.GoogleApiAvailability"));
-        assert!(s.contains("isGooglePlayServicesAvailable"));
-        assert!(s.contains("Java.perform"));
-        // Root-detection bypass.
-        assert!(s.contains("com.scottyab.rootbeer.RootBeer"));
-        assert!(s.contains("release-keys"));
-        assert!(s.contains("ro.debuggable"));
-    }
 
     #[test]
     fn config_points_at_script() {
@@ -1003,21 +904,16 @@ mod tests {
         let js = extract_codeshare_source(api_json).unwrap();
         assert_eq!(js, "Java.perform(function() { console.log('AES hooked'); });");
 
-        let combined = build_gadget_script(
-            true,
-            &[("dzonerzy/aesinfo".into(), js.clone())],
-        );
-        assert!(combined.contains("isGooglePlayServicesAvailable"));
+        let combined = build_gadget_script(&[("dzonerzy/aesinfo".into(), js)]);
         assert!(combined.contains("dzonerzy/aesinfo"));
         assert!(combined.contains("AES hooked"));
         assert!(combined.contains("__bogusmipsWrapped"));
+        assert!(combined.contains("__android_log_write"));
+        assert!(combined.contains(FRIDA_LOGCAT_TAG));
+        assert!(combined.contains("[bogusmips:script:start]"));
+        assert!(combined.contains("[bogusmips:script:ok]"));
 
-        let only_user = build_gadget_script(
-            false,
-            &[("dzonerzy/aesinfo".into(), js)],
-        );
-        assert!(!only_user.contains("isGooglePlayServicesAvailable"));
-        assert!(only_user.contains("AES hooked"));
+        assert!(build_gadget_script(&[]).is_empty());
     }
 
     #[test]
@@ -1048,7 +944,6 @@ mod tests {
     #[test]
     fn roundtrips_frida_config_json() {
         let cfg = FridaConfig {
-            bypass_checks: true,
             scripts: vec![
                 FridaScriptEntry::new("dzonerzy/aesinfo", true),
                 FridaScriptEntry::new("/tmp/hook.js", false),

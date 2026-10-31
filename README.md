@@ -44,12 +44,10 @@ Caveats — what cannot be decrypted:
 
 What *is* decrypted: apps using the Android **system trust store** — `HttpURLConnection`, OkHttp/Retrofit, Conscrypt and most native networking. (Already-running cached system processes are not re-forked, so they may keep showing trust-anchor errors until restarted; this does not affect the launched target app.)
 
-**Bypassing the Play Services & root checks.** Rootable `google_apis` emulators ship an older Google Play Services build than many apps are compiled against (so a `GoogleApiAvailability.isGooglePlayServicesAvailable()` check returns `SERVICE_VERSION_UPDATE_REQUIRED`), and their `userdebug` build looks rooted (`ro.debuggable=1`, `test-keys`, RootBeer). Either makes an app abort before producing traffic. Tick **Bypass Play Services & root checks** before starting a capture to inject [frida-gadget](https://frida.re/docs/gadget/) into the target app (via the `wrap.<package>` property / `LD_PRELOAD`) with a script that forces the Play Services checks to report success and neutralises the common root checks (RootBeer, `test-keys`/dangerous props, `su`/magisk probes). It only makes the checks pass — it does not provide the services or un-root the device — which is enough to keep these environment checks from blocking analysis. The gadget is downloaded once (needs network access) and cached; it requires a rootable emulator.
-
-**Custom Frida & CodeShare scripts.** Under **Frida scripts** in the Network view, you can add any number of Frida scripts and individually toggle which ones to inject for a capture session:
+**Custom Frida & CodeShare scripts.** Under **Frida scripts** in the Network view, you can add any number of Frida scripts and individually toggle which ones to inject via [frida-gadget](https://frida.re/docs/gadget/) (`wrap.<package>` / `LD_PRELOAD`) for a capture session:
 - **Frida CodeShare projects** by slug (`dzonerzy/aesinfo`), CLI syntax (`frida --codeshare dzonerzy/aesinfo`), or URL (`https://codeshare.frida.re/@dzonerzy/aesinfo/`) — fetched from the CodeShare API and cached under `~/.cache/bogusmips/codeshare/`.
 - **Local `.js` script files** (typed or selected via the file picker button) and direct **`https://` script URLs**.
-- Output emitted by scripts via `console.log(...)` or `send(...)` is streamed from `logcat` into the collapsible **Log** view during capture. Your configured script list and enabled state are saved to `~/.config/bogusmips/frida.json`.
+- Live UI status feedback (`Loading…`, `Armed`, `✔ Working (N)`, or `✖ Error`) shows whether each enabled script has loaded and is executing inside the app, and output emitted via `console.log(...)` or `send(...)` is streamed from `logcat` into the collapsible **Log** view during capture. Your configured script list and enabled state are saved to `~/.config/bogusmips/frida.json`.
 
 Limitations: this uses frida's Java instrumentation, so it needs a **frida-supported** Android image — brand-new preview API levels (e.g. API 37) are not yet supported by frida and will not work; use an API 34/35 rootable image. The pinned frida version can be overridden with the `BOGUSMIPS_FRIDA_VERSION` environment variable. Because the gadget is injected via `LD_PRELOAD` and cannot suspend the app, the hooks are applied a moment after launch (frida cannot safely touch ART any earlier) — so checks that run **during very early app startup** can still win the race and are not reliably bypassed; beating those needs frida spawn-gating (frida-server) rather than the gadget. It also cannot defeat checks implemented in native code, apps with their own obfuscated/duplicated detectors, or **server-side attestation** such as the Play Integrity API.
 
@@ -89,7 +87,7 @@ cargo run --release --example search_package -- app.apk "getString" [--regex] [-
 # Open packages and inspect every node, reporting timings and decode errors
 cargo run --release --example inspect_all -- app.apk other.xapk
 # Capture an app's live HTTP/HTTPS traffic through the MITM proxy (headless)
-cargo run --example net_capture -- app.xapk <AVD-name> [seconds] [--bypass] [--codeshare dzonerzy/aesinfo] [--script path/to/hook.js]
+cargo run --example net_capture -- app.xapk <AVD-name> [seconds] [--codeshare dzonerzy/aesinfo] [--script path/to/hook.js]
 ```
 
 ## Project structure
@@ -110,7 +108,7 @@ src/
 ├── net/                 # Network view: emulator control + MITM proxy
 │   ├── mod.rs
 │   ├── ca.rs            # proxy CA + per-host leaf certificates (rcgen)
-│   ├── bypass.rs        # optional Play Services check bypass (frida-gadget)
+│   ├── bypass.rs        # user-defined Frida & CodeShare scripts (frida-gadget)
 │   ├── http.rs          # HTTP/1.x request/response parsing (chunked, gzip)
 │   ├── proxy.rs         # MITM proxy: CONNECT, TLS terminate, re-originate, capture
 │   ├── capture.rs       # thread-safe captured-flow store

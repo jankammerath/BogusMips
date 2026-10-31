@@ -20,7 +20,6 @@ pub struct NetworkViewState {
     pub avd: String,
     pub filter: String,
     pub log_expanded: bool,
-    pub bypass_checks: bool,
     /// User-defined Frida scripts (CodeShare `owner/slug`, URL, or local `.js`
     /// file path) with individual enable/disable checkboxes.
     pub scripts: Vec<FridaScriptEntry>,
@@ -35,7 +34,6 @@ pub struct NetworkViewState {
 impl NetworkViewState {
     pub fn from_config(cfg: &FridaConfig, persist_config: bool) -> Self {
         Self {
-            bypass_checks: cfg.bypass_checks,
             scripts: cfg.scripts.clone(),
             persist_config,
             ..Self::default()
@@ -44,7 +42,6 @@ impl NetworkViewState {
 
     pub fn to_config(&self) -> FridaConfig {
         FridaConfig {
-            bypass_checks: self.bypass_checks,
             scripts: self.scripts.clone(),
         }
     }
@@ -200,25 +197,6 @@ pub fn show(
                     });
             });
             ui.add_space(6.0);
-
-            ui.add_enabled_ui(!running, |ui| {
-                if ui
-                    .checkbox(&mut state.bypass_checks, "Bypass Play Services & root checks")
-                    .on_hover_text(
-                        "Inject a frida gadget that makes Google Play Services \
-                         availability checks report success and neutralises common \
-                         root-detection checks (RootBeer, test-keys, su), so apps \
-                         that abort on a rooted/Play-Services-less emulator keep \
-                         running. Downloads the gadget once (needs network and a \
-                         rootable emulator). Cannot defeat server-side Play Integrity.",
-                    )
-                    .changed()
-                {
-                    state.save_if_enabled();
-                }
-            });
-
-            ui.add_space(4.0);
             if let Some(a) = frida_scripts_block(ui, controller, state, running) {
                 action = Some(a);
             }

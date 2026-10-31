@@ -891,12 +891,7 @@ impl BogusMipsApp {
         if let Some(dir) = doc.net_tempdir.take() {
             let _ = std::fs::remove_dir_all(dir);
         }
-        match build_start_config(
-            &doc.package,
-            avd,
-            doc.net_view.bypass_checks,
-            doc.net_view.enabled_scripts(),
-        ) {
+        match build_start_config(&doc.package, avd, doc.net_view.enabled_scripts()) {
             Ok((config, tempdir)) => {
                 doc.net_tempdir = Some(tempdir);
                 doc.net.start(config);
@@ -1013,7 +1008,6 @@ impl BogusMipsApp {
 fn build_start_config(
     package: &Package,
     avd: String,
-    bypass_checks: bool,
     frida_scripts: Vec<String>,
 ) -> Result<(StartConfig, PathBuf), String> {
     use crate::package::PackageKind;
@@ -1056,7 +1050,6 @@ fn build_start_config(
             avd,
             apks,
             package: package_name,
-            bypass_checks,
             frida_scripts,
         },
         tempdir,
@@ -1852,10 +1845,8 @@ mod tests {
             ("config.arm64_v8a.apk", &inner_apk),
         ]);
         let package = Package::from_bytes(Path::new("app.xapk"), xapk.into()).unwrap();
-        let (_cfg1, dir1) =
-            build_start_config(&package, "avd".into(), false, vec![]).unwrap();
-        let (cfg2, dir2) =
-            build_start_config(&package, "avd".into(), false, vec![]).unwrap();
+        let (_cfg1, dir1) = build_start_config(&package, "avd".into(), vec![]).unwrap();
+        let (cfg2, dir2) = build_start_config(&package, "avd".into(), vec![]).unwrap();
         assert_ne!(dir1, dir2);
         // Removing the first session's temp dir must leave the second session's APKs intact.
         std::fs::remove_dir_all(&dir1).unwrap();

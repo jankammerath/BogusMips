@@ -403,17 +403,9 @@ impl Emulator {
             .map(|s| s.trim().to_owned())
     }
 
-    /// Arms the Play Services availability and root-detection bypass for
-    /// `package`: pushes the frida gadget, its config and the bypass script,
-    /// and sets the `wrap.<package>` property so the gadget is `LD_PRELOAD`ed
-    /// when the app next starts (which must be *after* this call).
-    pub fn install_bypass(&self, gadget_local: &Path, package: &str) -> Step {
-        self.install_frida_script(gadget_local, package, bypass::bypass_script())
-    }
-
-    /// Pushes `gadget_local`, its config, and the assembled `script_js` (the
-    /// built-in bypass and/or user-selected Frida scripts), then sets
-    /// `wrap.<package>` so `frida-gadget` is `LD_PRELOAD`ed on app launch.
+    /// Pushes `gadget_local`, its config, and the assembled `script_js` for
+    /// the user-selected Frida scripts, then sets `wrap.<package>` so
+    /// `frida-gadget` is `LD_PRELOAD`ed on app launch.
     pub fn install_frida_script(
         &self,
         gadget_local: &Path,
@@ -433,10 +425,10 @@ impl Emulator {
         self.push_bytes(cfg.as_bytes(), CONFIG)?;
         self.push_bytes(cfg.as_bytes(), CONFIG_SO)?;
 
-        // The app's SELinux domain must be able to read and execute the gadget;
-        // files left in /data/local/tmp carry `shell_data_file`, which apps may
-        // not map as code, so relabel them like app native libraries.
-        let _ = self.adb(&["shell", "chmod", "644", GADGET, SCRIPT, CONFIG, CONFIG_SO]);
+        // The app's SELinux domain must be able to traverse /data/local/tmp,
+        // map the gadget .so as executable code, and read its config/script.
+        let _ = self.adb(&["shell", "chmod", "755", "/data/local/tmp", GADGET]);
+        let _ = self.adb(&["shell", "chmod", "644", SCRIPT, CONFIG, CONFIG_SO]);
         let _ = self.adb(&[
             "shell",
             "chcon",
@@ -446,11 +438,12 @@ impl Emulator {
             CONFIG,
             CONFIG_SO,
         ]);
+        let _ = self.adb(&["shell", "setenforce", "0"]);
 
         let prop = format!("wrap.{package}");
         let value = format!("LD_PRELOAD={GADGET}");
         self.adb(&["shell", "setprop", &prop, &value])
-            .map_err(|e| format!("could not arm the bypass (setprop {prop}): {e}"))?;
+            .map_err(|e| format!("could not arm Frida gadget (setprop {prop}): {e}"))?;
         let _ = self.adb(&["shell", "am", "force-stop", package]);
         Ok("Frida gadget armed".into())
     }
@@ -461,10 +454,11 @@ impl Emulator {
         let _ = self.adb(&["logcat", "-c"]);
     }
 
-    /// Returns lines logged by `frida-gadget` (`console.log` / `send`) to the
-    /// `Frida` logcat tag.
+    /// Returns lines logged by the injected Frida script (`console.log` /
+    /// `send`) via the [`bypass::FRIDA_LOGCAT_TAG`] logcat tag.
     pub fn frida_log_lines(&self) -> Vec<String> {
-        let Ok(out) = self.adb(&["logcat", "-d", "-v", "raw", "-s", "Frida:V"]) else {
+        let filter = format!("{}:V", bypass::FRIDA_LOGCAT_TAG);
+        let Ok(out) = self.adb(&["logcat", "-d", "-v", "raw", "-s", &filter]) else {
             return Vec::new();
         };
         out.lines()

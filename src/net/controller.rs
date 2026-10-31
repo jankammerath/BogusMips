@@ -43,7 +43,7 @@ impl Phase {
             Phase::EnablingRoot => "Enabling root",
             Phase::InstallingCa => "Installing the proxy certificate",
             Phase::InstallingApp => "Installing the app",
-            Phase::InstallingBypass => "Bypassing Play Services and root checks",
+            Phase::InstallingBypass => "Injecting Frida scripts",
             Phase::Launching => "Launching the app",
             Phase::Capturing => "Capturing",
             Phase::Stopped => "Stopped",
@@ -163,8 +163,6 @@ pub struct StartConfig {
     pub apks: Vec<PathBuf>,
     /// Package to launch after install.
     pub package: Option<String>,
-    /// Inject the frida-gadget Play Services availability bypass before launch.
-    pub bypass_checks: bool,
     /// Enabled user-defined Frida scripts (CodeShare slugs like
     /// `dzonerzy/aesinfo`, URLs, or local `.js` paths) to inject via
     /// `frida-gadget`.
@@ -363,7 +361,7 @@ fn run_session(
             emulator.install_app(&config.apks)
         );
     }
-    let needs_frida = config.bypass_checks || !config.frida_scripts.is_empty();
+    let needs_frida = !config.frida_scripts.is_empty();
     if let Some(package) = &config.package {
         if needs_frida {
             let install_frida = || -> Result<String, String> {
@@ -401,7 +399,7 @@ fn run_session(
                         }
                     }
                 }
-                let combined = bypass::build_gadget_script(config.bypass_checks, &loaded);
+                let combined = bypass::build_gadget_script(&loaded);
                 emulator.clear_logcat();
                 let res = emulator.install_frida_script(&gadget, package, &combined)?;
                 {
@@ -412,13 +410,7 @@ fn run_session(
                 }
                 Ok(res)
             };
-            let label = match (config.bypass_checks, config.frida_scripts.len()) {
-                (true, 0) => "Bypassing Play Services and root checks".to_owned(),
-                (false, n) => format!("Injecting {n} Frida script(s)"),
-                (true, n) => format!(
-                    "Bypassing Play Services/root checks and injecting {n} Frida script(s)"
-                ),
-            };
+            let label = format!("Injecting {} Frida script(s)", config.frida_scripts.len());
             step!(Phase::InstallingBypass, &label, install_frida());
         }
         step!(Phase::Launching, "Launching the app", emulator.launch(package));
@@ -478,7 +470,6 @@ mod tests {
             avd: "x".into(),
             apks: vec![],
             package: None,
-            bypass_checks: false,
             frida_scripts: Vec::new(),
         });
         let (phase, error, _) = controller.status_snapshot();
