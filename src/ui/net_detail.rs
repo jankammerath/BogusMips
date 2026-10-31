@@ -1,11 +1,15 @@
 //! Editor content for a captured network flow: an overview, the request and
 //! the response, with header tables and decoded bodies.
 
-use eframe::egui::{self, RichText, ScrollArea, Sense, TextStyle, text::LayoutJob, vec2};
+use eframe::egui::{
+    self, Color32, ColorImage, RichText, ScrollArea, Sense, TextStyle, TextureHandle,
+    TextureOptions, text::LayoutJob, vec2,
+};
 
 use super::content_view::EditorResponse;
 use super::highlight::{self, TEXT};
 use super::icons::{self, Icon};
+use super::svg;
 use super::theme;
 use crate::beautify;
 use crate::inspect::{InfoSection, Syntax, format_size, group_digits};
@@ -22,10 +26,19 @@ pub enum FlowTab {
 
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
 pub enum BodyView {
+    /// Formatted text for text bodies, or rendered image preview for raster/SVG images.
     #[default]
     Pretty,
+    /// Formatted XML source view for SVG images.
+    Source,
     Raw,
     Hex,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageKind {
+    Raster(&'static str),
+    Svg,
 }
 
 #[derive(Default)]
@@ -59,6 +72,137 @@ fn content_type(headers: &Headers) -> Option<String> {
     headers
         .get("content-type")
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_owned())
+}
+
+/// Detects whether a decoded HTTP message body is a raster or SVG image.
+pub fn detect_body_image(headers: &Headers, decoded: &[u8]) -> Option<ImageKind> {
+    if decoded.is_empty() {
+        return None;
+    }
+    if decoded.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some(ImageKind::Raster("PNG"));
+    }
+    if decoded.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some(ImageKind::Raster("JPEG"));
+    }
+    if decoded.starts_with(b"GIF87a") || decoded.starts_with(b"GIF89a") {
+        return Some(ImageKind::Raster("GIF"));
+    }
+    if decoded.len() >= 12 && &decoded[0..4] == b"RIFF" && &decoded[8..12] == b"WEBP" {
+        return Some(ImageKind::Raster("WebP"));
+    }
+    let ctype = content_type(headers).unwrap_or_default();
+    let ctype_lower = ctype.to_ascii_lowercase();
+    if decoded.starts_with(b"BM")
+        && decoded.len() > 26
+        && (ctype_lower == "image/bmp"
+            || ctype_lower == "image/x-bmp"
+            || ctype_lower == "image/x-ms-bmp"
+            || matches!(image::guess_format(decoded), Ok(image::ImageFormat::Bmp)))
+    {
+        return Some(ImageKind::Raster("BMP"));
+    }
+    if svg::is_svg( (!ctype.is_empty()).then_some(ctype.as_str()), decoded) {
+        return Some(ImageKind::Svg);
+    }
+    if ctype_lower.starts_with("image/") {
+        if let Ok(fmt) = image::guess_format(decoded) {
+            let label = match fmt {
+                image::ImageFormat::Png => "PNG",
+                image::ImageFormat::Jpeg => "JPEG",
+                image::ImageFormat::Gif => "GIF",
+                image::ImageFormat::WebP => "WebP",
+                image::ImageFormat::Bmp => "BMP",
+                _ => "Image",
+            };
+            return Some(ImageKind::Raster(label));
+        }
+    }
+    None
+}
+
+/// Formats the HTTP request (request line, headers, and decoded/formatted body) for clipboard copy.
+pub fn format_request(flow: &Flow, view: BodyView) -> String {
+    let mut out = format!("{} {} HTTP/1.1\n", flow.method, flow.path);
+    for (name, value) in &flow.req_headers.0 {
+        out.push_str(&format!("{name}: {value}\n"));
+    }
+    if !flow.req_body.is_empty() {
+        out.push('\n');
+        out.push_str(&format_body_for_copy(&flow.req_headers, &flow.req_body, view));
+    }
+    out
+}
+
+/// Formats the HTTP response (status line, headers, and decoded/formatted body) for clipboard copy.
+pub fn format_response(flow: &Flow, view: BodyView) -> String {
+    let Some(status) = flow.status else {
+        return flow
+            .error
+            .as_ref()
+            .map_or_else(|| "Waiting for the response…".to_owned(), |e| format!("Error: {e}"));
+    };
+    let mut out = format!("HTTP/1.1 {status} {}\n", flow.reason);
+    for (name, value) in &flow.resp_headers.0 {
+        out.push_str(&format!("{name}: {value}\n"));
+    }
+    if !flow.resp_body.is_empty() {
+        out.push('\n');
+        out.push_str(&format_body_for_copy(&flow.resp_headers, &flow.resp_body, view));
+    }
+    out
+}
+
+/// Formats both the HTTP request and response for clipboard copy.
+pub fn format_flow(flow: &Flow, view: BodyView) -> String {
+    let mut out = format_request(flow, view);
+    if flow.status.is_some() || flow.error.is_some() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&format_response(flow, view));
+    }
+    out
+}
+
+fn format_body_for_copy(headers: &Headers, body: &[u8], view: BodyView) -> String {
+    if view == BodyView::Hex {
+        return format_hex_string(body);
+    }
+    let (decoded, _) = crate::net::http::decode_for_display(headers, body);
+    let shown = &decoded[..decoded.len().min(MAX_SHOWN)];
+    match std::str::from_utf8(shown) {
+        Ok(text) => {
+            let ctype = content_type(headers).unwrap_or_default();
+            if matches!(view, BodyView::Pretty | BodyView::Source) {
+                pretty(&ctype, text).0
+            } else {
+                text.to_owned()
+            }
+        }
+        Err(_) => format_hex_string(body),
+    }
+}
+
+fn format_hex_string(data: &[u8]) -> String {
+    let shown = &data[..data.len().min(MAX_SHOWN)];
+    let mut out = String::new();
+    for (row, chunk) in shown.chunks(16).enumerate() {
+        let mut hex = String::new();
+        for (i, b) in chunk.iter().enumerate() {
+            if i == 8 {
+                hex.push(' ');
+            }
+            hex.push_str(&format!("{b:02x} "));
+        }
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '.' })
+            .collect();
+        out.push_str(&format!("{:08x}  {hex:<50}{ascii}\n", row * 16));
+    }
+    out
 }
 
 fn tab_button(ui: &mut egui::Ui, state: &mut FlowTab, value: FlowTab, label: &str) {
@@ -114,6 +258,19 @@ pub fn show(ui: &mut egui::Ui, flow: &Flow, state: &mut FlowDetailState, info_vi
                         "Show file information (⌘I)"
                     };
                     response.toggle_info |= icons::button(ui, Icon::PanelRight, 20.0, tip).clicked();
+                    let copy_tip = match state.tab {
+                        FlowTab::Overview => "Copy request & response to clipboard",
+                        FlowTab::Request => "Copy request to clipboard",
+                        FlowTab::Response => "Copy response to clipboard",
+                    };
+                    if icons::button(ui, Icon::Copy, 20.0, copy_tip).clicked() {
+                        let copied = match state.tab {
+                            FlowTab::Overview => format_flow(flow, state.body),
+                            FlowTab::Request => format_request(flow, state.body),
+                            FlowTab::Response => format_response(flow, state.body),
+                        };
+                        ui.ctx().copy_text(copied);
+                    }
                 });
             });
             ui.add_space(2.0);
@@ -152,7 +309,7 @@ pub fn show(ui: &mut egui::Ui, flow: &Flow, state: &mut FlowDetailState, info_vi
     match state.tab {
         FlowTab::Overview => overview(ui, flow),
         FlowTab::Request => {
-            body_toolbar(ui, state, &flow.req_headers, flow.id, "req");
+            body_toolbar(ui, state, flow, &flow.req_headers, &flow.req_body, "req");
             message(ui, flow.id, "req", &flow.req_headers, &flow.req_body, state.body);
         }
         FlowTab::Response => {
@@ -162,7 +319,7 @@ pub fn show(ui: &mut egui::Ui, flow: &Flow, state: &mut FlowDetailState, info_vi
                     ui.label(RichText::new(text).color(theme::TEXT_DIM));
                 });
             } else {
-                body_toolbar(ui, state, &flow.resp_headers, flow.id, "resp");
+                body_toolbar(ui, state, flow, &flow.resp_headers, &flow.resp_body, "resp");
                 message(ui, flow.id, "resp", &flow.resp_headers, &flow.resp_body, state.body);
             }
         }
@@ -202,32 +359,90 @@ fn overview(ui: &mut egui::Ui, flow: &Flow) {
         });
 }
 
-fn body_toolbar(ui: &mut egui::Ui, state: &mut FlowDetailState, headers: &Headers, id: u64, _tag: &str) {
+fn body_toolbar(
+    ui: &mut egui::Ui,
+    state: &mut FlowDetailState,
+    flow: &Flow,
+    headers: &Headers,
+    body: &[u8],
+    tag: &str,
+) {
+    let (decoded, _) = crate::net::http::decode_for_display(headers, body);
+    let img_kind = detect_body_image(headers, &decoded);
+
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         ui.label(RichText::new("Body").size(12.0).color(theme::TEXT_DIM));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            for (value, label) in [
-                (BodyView::Hex, "Hex"),
-                (BodyView::Raw, "Raw"),
-                (BodyView::Pretty, "Pretty"),
-            ] {
-                let selected = state.body == value;
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(label)
-                            .size(12.0)
-                            .color(if selected { theme::TEXT_BRIGHT } else { theme::TEXT_DIM }),
-                    ).fill(if selected { theme::PILL } else { egui::Color32::TRANSPARENT }))
-                    .clicked()
-                {
-                    state.body = value;
+            let copy_tip = if tag == "req" {
+                "Copy request to clipboard"
+            } else {
+                "Copy response to clipboard"
+            };
+            if icons::button(ui, Icon::Copy, 20.0, copy_tip).clicked() {
+                let text = if tag == "req" {
+                    format_request(flow, state.body)
+                } else {
+                    format_response(flow, state.body)
+                };
+                ui.ctx().copy_text(text);
+            }
+            ui.add_space(4.0);
+
+            match img_kind {
+                Some(ImageKind::Svg) => {
+                    for (value, label) in [
+                        (BodyView::Hex, "Hex"),
+                        (BodyView::Raw, "Raw"),
+                        (BodyView::Source, "Source"),
+                        (BodyView::Pretty, "Image"),
+                    ] {
+                        let selected = state.body == value;
+                        if view_pill(ui, label, selected).clicked() {
+                            state.body = value;
+                        }
+                    }
+                }
+                Some(ImageKind::Raster(_)) => {
+                    for (value, label, selected) in [
+                        (BodyView::Hex, "Hex", state.body == BodyView::Hex),
+                        (BodyView::Pretty, "Image", state.body != BodyView::Hex),
+                    ] {
+                        if view_pill(ui, label, selected).clicked() {
+                            state.body = value;
+                        }
+                    }
+                }
+                None => {
+                    for (value, label, selected) in [
+                        (BodyView::Hex, "Hex", state.body == BodyView::Hex),
+                        (BodyView::Raw, "Raw", state.body == BodyView::Raw),
+                        (
+                            BodyView::Pretty,
+                            "Pretty",
+                            matches!(state.body, BodyView::Pretty | BodyView::Source),
+                        ),
+                    ] {
+                        if view_pill(ui, label, selected).clicked() {
+                            state.body = value;
+                        }
+                    }
                 }
             }
-            let _ = (headers, id);
         });
     });
+}
+
+fn view_pill(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Response {
+    ui.add(
+        egui::Button::new(
+            RichText::new(label)
+                .size(12.0)
+                .color(if selected { theme::TEXT_BRIGHT } else { theme::TEXT_DIM }),
+        )
+        .fill(if selected { theme::PILL } else { egui::Color32::TRANSPARENT }),
+    )
 }
 
 fn message(ui: &mut egui::Ui, id: u64, tag: &str, headers: &Headers, body: &[u8], view: BodyView) {
@@ -255,7 +470,7 @@ fn message(ui: &mut egui::Ui, id: u64, tag: &str, headers: &Headers, body: &[u8]
                     ui.add_space(8.0);
                     ui.separator();
                     ui.add_space(4.0);
-                    body_contents(ui, headers, body, view);
+                    body_contents(ui, id, tag, headers, body, view);
                 });
         });
 }
@@ -263,13 +478,38 @@ fn message(ui: &mut egui::Ui, id: u64, tag: &str, headers: &Headers, body: &[u8]
 /// Largest body rendered inline; more is truncated with a note.
 const MAX_SHOWN: usize = 512 * 1024;
 
-fn body_contents(ui: &mut egui::Ui, headers: &Headers, body: &[u8], view: BodyView) {
+fn body_contents(
+    ui: &mut egui::Ui,
+    id: u64,
+    tag: &str,
+    headers: &Headers,
+    body: &[u8],
+    view: BodyView,
+) {
     let mono = TextStyle::Monospace.resolve(ui.style());
     if view == BodyView::Hex {
         hex_dump(ui, body, &mono);
         return;
     }
     let (decoded, _enc) = crate::net::http::decode_for_display(headers, body);
+    let img_kind = detect_body_image(headers, &decoded);
+
+    match img_kind {
+        Some(ImageKind::Raster(fmt)) => {
+            if render_raster_body(ui, id, tag, fmt, &decoded, body.len()) {
+                return;
+            }
+        }
+        Some(ImageKind::Svg) if view == BodyView::Pretty => {
+            if let Ok(svg_text) = std::str::from_utf8(&decoded) {
+                if render_svg_body(ui, id, tag, svg_text, body.len()) {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+
     let shown = &decoded[..decoded.len().min(MAX_SHOWN)];
     let text = match std::str::from_utf8(shown) {
         Ok(text) => text.to_owned(),
@@ -283,7 +523,7 @@ fn body_contents(ui: &mut egui::Ui, headers: &Headers, body: &[u8], view: BodyVi
     };
 
     let ctype = content_type(headers).unwrap_or_default();
-    let (display, syntax) = if view == BodyView::Pretty {
+    let (display, syntax) = if matches!(view, BodyView::Pretty | BodyView::Source) {
         pretty(&ctype, &text)
     } else {
         (text, Syntax::Plain)
@@ -302,8 +542,172 @@ fn body_contents(ui: &mut egui::Ui, headers: &Headers, body: &[u8], view: BodyVi
     }
 }
 
+#[derive(Clone)]
+struct CachedFlowImage {
+    len: usize,
+    texture: TextureHandle,
+    display_size: (f32, f32),
+    pixel_size: (u32, u32),
+}
+
+fn render_raster_body(
+    ui: &mut egui::Ui,
+    id: u64,
+    tag: &str,
+    fmt: &str,
+    decoded: &[u8],
+    raw_len: usize,
+) -> bool {
+    let cache_id = egui::Id::new(("flow_raster_tex", id, tag));
+    let cached: Option<CachedFlowImage> =
+        ui.ctx().data_mut(|d| d.get_temp::<CachedFlowImage>(cache_id));
+    let entry = match cached.filter(|c| c.len == decoded.len()) {
+        Some(c) => c,
+        None => {
+            let Ok(dyn_img) = image::load_from_memory(decoded) else {
+                return false;
+            };
+            let rgba = dyn_img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let color_image =
+                ColorImage::from_rgba_unmultiplied([w as usize, h as usize], rgba.as_raw());
+            let texture = ui.ctx().load_texture(
+                format!("flow_{id}_{tag}_raster"),
+                color_image,
+                TextureOptions::LINEAR,
+            );
+            let entry = CachedFlowImage {
+                len: decoded.len(),
+                texture,
+                display_size: (w as f32, h as f32),
+                pixel_size: (w, h),
+            };
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(cache_id, entry.clone()));
+            entry
+        }
+    };
+
+    let (pw, ph) = entry.pixel_size;
+    ui.label(
+        RichText::new(format!(
+            "{fmt} image · {pw} × {ph} px · {}",
+            format_size(raw_len as u64)
+        ))
+        .size(12.0)
+        .color(theme::TEXT_DIM),
+    );
+    ui.add_space(6.0);
+    paint_image_preview(ui, &entry.texture, entry.display_size);
+    true
+}
+
+fn render_svg_body(
+    ui: &mut egui::Ui,
+    id: u64,
+    tag: &str,
+    svg_text: &str,
+    raw_len: usize,
+) -> bool {
+    let cache_id = egui::Id::new(("flow_svg_tex", id, tag));
+    let cached: Option<CachedFlowImage> =
+        ui.ctx().data_mut(|d| d.get_temp::<CachedFlowImage>(cache_id));
+    let entry = match cached.filter(|c| c.len == svg_text.len()) {
+        Some(c) => c,
+        None => {
+            let Some(rendered) = svg::render_svg(svg_text, 512) else {
+                return false;
+            };
+            let (dw, dh) = rendered.display_size;
+            let texture = ui.ctx().load_texture(
+                format!("flow_{id}_{tag}_svg"),
+                rendered.image,
+                TextureOptions::LINEAR,
+            );
+            let entry = CachedFlowImage {
+                len: svg_text.len(),
+                texture,
+                display_size: (dw, dh),
+                pixel_size: (dw.round() as u32, dh.round() as u32),
+            };
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(cache_id, entry.clone()));
+            entry
+        }
+    };
+
+    let (pw, ph) = entry.pixel_size;
+    ui.label(
+        RichText::new(format!(
+            "SVG image · {pw} × {ph} px · {}",
+            format_size(raw_len as u64)
+        ))
+        .size(12.0)
+        .color(theme::TEXT_DIM),
+    );
+    ui.add_space(6.0);
+    paint_image_preview(ui, &entry.texture, entry.display_size);
+    true
+}
+
+fn paint_image_preview(ui: &mut egui::Ui, texture: &TextureHandle, (mut w, mut h): (f32, f32)) {
+    let max_w = (ui.available_width() - 16.0).max(64.0);
+    let max_h = 480.0f32;
+    if w > max_w {
+        let s = max_w / w;
+        w *= s;
+        h *= s;
+    }
+    if h > max_h {
+        let s = max_h / h;
+        w *= s;
+        h *= s;
+    }
+    let size = vec2(w.max(1.0), h.max(1.0));
+    let pad = vec2(8.0, 8.0);
+    let (outer, _) = ui.allocate_exact_size(size + pad * 2.0, Sense::hover());
+    let inner = outer.shrink2(pad);
+
+    // Subtle checkerboard backdrop so both dark-on-transparent and white-on-transparent
+    // images remain clearly visible.
+    let painter = ui.painter_at(outer);
+    let c_dark = Color32::from_rgb(0x26, 0x26, 0x26);
+    let c_light = Color32::from_rgb(0x32, 0x32, 0x32);
+    painter.rect_filled(outer, 4.0, c_dark);
+    let tile = 8.0f32;
+    let cols = (outer.width() / tile).ceil() as i32;
+    let rows = (outer.height() / tile).ceil() as i32;
+    for r in 0..rows {
+        for c in 0..cols {
+            if (r + c) % 2 == 1 {
+                let min = outer.min + vec2(c as f32 * tile, r as f32 * tile);
+                let max = (min + vec2(tile, tile)).min(outer.max);
+                if max.x > min.x && max.y > min.y {
+                    painter.rect_filled(egui::Rect::from_min_max(min, max), 0.0, c_light);
+                }
+            }
+        }
+    }
+    painter.rect_stroke(
+        outer,
+        4.0,
+        egui::Stroke::new(1.0, theme::CARD_BORDER),
+        egui::StrokeKind::Inside,
+    );
+    painter.image(
+        texture.id(),
+        inner,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
+
 fn pretty(content_type: &str, text: &str) -> (String, Syntax) {
-    let format = beautify::detect(content_type_to_path(content_type), text);
+    let path = match content_type_to_path(content_type) {
+        "body" if svg::looks_like_svg_str(text) => "body.svg",
+        other => other,
+    };
+    let format = beautify::detect(path, text);
     match format {
         Some(f) => {
             let out = beautify::beautify(f, text).unwrap_or_else(|| text.to_owned());
@@ -314,12 +718,15 @@ fn pretty(content_type: &str, text: &str) -> (String, Syntax) {
 }
 
 fn content_type_to_path(content_type: &str) -> &'static str {
-    match content_type {
+    let ct = content_type.to_ascii_lowercase();
+    match ct.as_str() {
         "application/json" | "text/json" => "body.json",
-        "application/xml" | "text/xml" => "body.xml",
+        "application/xml" | "text/xml" | "image/svg+xml" | "image/svg" => "body.xml",
         "text/html" => "body.html",
         "text/css" => "body.css",
         "application/javascript" | "text/javascript" => "body.js",
+        _ if ct.ends_with("+json") => "body.json",
+        _ if ct.ends_with("+xml") => "body.xml",
         _ => "body",
     }
 }
@@ -416,7 +823,7 @@ mod tests {
     use super::*;
     use crate::net::capture::{Capture, RequestInfo};
     use crate::net::http::{Request, Response};
-    use std::io::BufReader;
+    use std::io::{BufReader, Cursor};
 
     fn sample_flow() -> std::sync::Arc<Flow> {
         let capture = Capture::new();
@@ -433,6 +840,26 @@ mod tests {
         )
         .unwrap();
         capture.finish_response(&pending, &response, 50);
+        capture.snapshot()[0].clone()
+    }
+
+    fn flow_with_response(content_type: &str, body: &[u8]) -> std::sync::Arc<Flow> {
+        let capture = Capture::new();
+        let request = Request::read(&mut BufReader::new(
+            &b"GET /asset HTTP/1.1\r\nHost: cdn.x\r\n\r\n"[..],
+        ))
+        .unwrap()
+        .unwrap();
+        let info = RequestInfo::from_request(Scheme::Https, "cdn.x:443", &request, 40);
+        let pending = capture.start(&info);
+        let mut raw_resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw_resp.extend_from_slice(body);
+        let response = Response::read(&mut BufReader::new(&raw_resp[..]), "GET").unwrap();
+        capture.finish_response(&pending, &response, 64);
         capture.snapshot()[0].clone()
     }
 
@@ -455,6 +882,90 @@ mod tests {
         // Unknown types are left alone.
         let (out, syntax) = pretty("text/plain", "hello");
         assert_eq!((out.as_str(), syntax), ("hello", Syntax::Plain));
+    }
+
+    #[test]
+    fn pretty_prints_svg_xml_bodies() {
+        let (out, syntax) = pretty(
+            "image/svg+xml",
+            "<svg viewBox=\"0 0 10 10\"><rect width=\"10\" height=\"10\"/></svg>",
+        );
+        assert!(out.contains("<svg"));
+        assert!(out.contains("\n    <rect"));
+        assert_eq!(syntax, Syntax::Xml);
+    }
+
+    #[test]
+    fn formats_request_and_response_for_clipboard() {
+        let flow = sample_flow();
+        let req_text = format_request(&flow, BodyView::Pretty);
+        assert!(req_text.starts_with("POST /api HTTP/1.1\n"));
+        assert!(req_text.contains("Host: api.x\n"));
+        assert!(req_text.contains("\"a\": 1"));
+
+        let resp_text = format_response(&flow, BodyView::Pretty);
+        assert!(resp_text.starts_with("HTTP/1.1 200 OK\n"));
+        assert!(resp_text.contains("Content-Type: application/json\n"));
+        assert!(resp_text.contains("\"ok\": 1"));
+
+        let full = format_flow(&flow, BodyView::Raw);
+        assert!(full.contains("POST /api HTTP/1.1"));
+        assert!(full.contains("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn renders_raster_image_instead_of_hex_prompt() {
+        let mut png_bytes = Vec::new();
+        let img = image::RgbaImage::from_pixel(12, 8, image::Rgba([40, 180, 240, 255]));
+        img.write_to(&mut Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+            .unwrap();
+        let flow = flow_with_response("image/png", &png_bytes);
+        let mut state = FlowDetailState {
+            tab: FlowTab::Response,
+            body: BodyView::Pretty,
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &flow, &mut state, true);
+            });
+        });
+        let cached = ctx.data_mut(|d| {
+            d.get_temp::<CachedFlowImage>(egui::Id::new(("flow_raster_tex", flow.id, "resp")))
+        });
+        assert!(cached.is_some(), "raster image texture should be loaded");
+        assert_eq!(cached.unwrap().pixel_size, (12, 8));
+    }
+
+    #[test]
+    fn renders_svg_image_and_switches_to_source() {
+        let svg_body = br##"<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32"><circle cx="16" cy="16" r="12" fill="#4ec9b0"/></svg>"##;
+        let flow = flow_with_response("image/svg+xml", svg_body);
+        let mut state = FlowDetailState {
+            tab: FlowTab::Response,
+            body: BodyView::Pretty,
+        };
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &flow, &mut state, true);
+            });
+        });
+        let cached = ctx.data_mut(|d| {
+            d.get_temp::<CachedFlowImage>(egui::Id::new(("flow_svg_tex", flow.id, "resp")))
+        });
+        assert!(cached.is_some(), "SVG image texture should be rendered in Image mode");
+        assert_eq!(cached.unwrap().pixel_size, (32, 32));
+
+        // Switching to Source mode renders the formatted XML source.
+        state.body = BodyView::Source;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                show(ui, &flow, &mut state, true);
+            });
+        });
+        let copied = format_response(&flow, state.body);
+        assert!(copied.contains("<circle cx=\"16\""));
     }
 
     #[test]

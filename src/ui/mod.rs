@@ -10,6 +10,7 @@ pub mod native_menu;
 pub mod net_detail;
 pub mod network_view;
 pub mod search_view;
+pub mod svg;
 pub mod theme;
 pub mod tree_view;
 
