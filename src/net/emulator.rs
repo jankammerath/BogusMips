@@ -417,6 +417,7 @@ impl Emulator {
         // frida accepts either form; push both so it is found regardless.
         const CONFIG: &str = "/data/local/tmp/bogusmips-gadget.config";
         const CONFIG_SO: &str = "/data/local/tmp/bogusmips-gadget.config.so";
+        const ARM_SCRIPT: &str = "/data/local/tmp/bogusmips_frida_arm.sh";
 
         let local = gadget_local.to_string_lossy();
         self.adb(&["push", &local, GADGET])?;
@@ -425,40 +426,42 @@ impl Emulator {
         self.push_bytes(cfg.as_bytes(), CONFIG)?;
         self.push_bytes(cfg.as_bytes(), CONFIG_SO)?;
 
-        // The app's SELinux domain must be able to traverse /data/local/tmp,
-        // map the gadget .so as executable code, and read its config/script.
-        let _ = self.adb(&["shell", "chmod", "755", "/data/local/tmp", GADGET]);
-        let _ = self.adb(&["shell", "chmod", "644", SCRIPT, CONFIG, CONFIG_SO]);
-        let _ = self.adb(&[
-            "shell",
-            "chcon",
-            "u:object_r:apk_data_file:s0",
-            GADGET,
-            SCRIPT,
-            CONFIG,
-            CONFIG_SO,
-        ]);
-        let _ = self.adb(&["shell", "setenforce", "0"]);
-
-        let prop = format!("wrap.{package}");
-        let value = format!("LD_PRELOAD={GADGET}");
-        self.adb(&["shell", "setprop", &prop, &value])
-            .map_err(|e| format!("could not arm Frida gadget (setprop {prop}): {e}"))?;
-        let _ = self.adb(&["shell", "am", "force-stop", package]);
-        Ok("Frida gadget armed".into())
+        let arm_sh = frida_arm_script(package);
+        self.push_bytes(arm_sh.as_bytes(), ARM_SCRIPT)?;
+        let out = self
+            .adb(&["shell", "su", "root", "sh", ARM_SCRIPT])
+            .or_else(|_| self.adb(&["shell", "sh", ARM_SCRIPT]))?;
+        if out.contains("ARMED") {
+            Ok("Frida gadget armed".into())
+        } else {
+            Err(format!("could not arm Frida gadget: {out}"))
+        }
     }
 
-    /// Clears the device's logcat ring buffer before launching the instrumented
-    /// app so subsequent [`Self::frida_log_lines`] calls only return fresh output.
+    /// Clears the device's logcat ring buffer and on-device Frida telemetry log
+    /// before launching the instrumented app so subsequent
+    /// [`Self::frida_log_lines`] calls only return fresh output.
     pub fn clear_logcat(&self) {
         let _ = self.adb(&["logcat", "-c"]);
     }
 
     /// Returns lines logged by the injected Frida script (`console.log` /
-    /// `send`) via the [`bypass::FRIDA_LOGCAT_TAG`] logcat tag.
+    /// `send`) via the on-device file [`bypass::FRIDA_DEVICE_LOG_PATH`] (with
+    /// fallback to the [`bypass::FRIDA_LOGCAT_TAG`] logcat tag).
     pub fn frida_log_lines(&self) -> Vec<String> {
+        if let Ok(out) = self.adb(&["shell", "cat", bypass::FRIDA_DEVICE_LOG_PATH]) {
+            let lines: Vec<String> = out
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(ToOwned::to_owned)
+                .collect();
+            if !lines.is_empty() {
+                return lines;
+            }
+        }
         let filter = format!("{}:V", bypass::FRIDA_LOGCAT_TAG);
-        let Ok(out) = self.adb(&["logcat", "-d", "-v", "raw", "-s", &filter]) else {
+        let Ok(out) = self.adb(&["logcat", "-d", "-v", "raw", "-s", &filter, "Frida:V"]) else {
             return Vec::new();
         };
         out.lines()
@@ -467,6 +470,56 @@ impl Emulator {
             .map(ToOwned::to_owned)
             .collect()
     }
+}
+
+/// Shell script executed as `root` on the device to label `/data/local/tmp`
+/// and the Frida gadget files so `untrusted_app` can traverse `/data/local/tmp`,
+/// map `bogusmips-gadget.so`, read its config/script, and append telemetry to
+/// [`bypass::FRIDA_DEVICE_LOG_PATH`].
+pub fn frida_arm_script(package: &str) -> String {
+    let prop = format!("wrap.{package}");
+    let prop_short = if prop.len() > 31 {
+        Some(prop[..31].to_owned())
+    } else {
+        None
+    };
+    let short_cmd = prop_short
+        .map(|s| format!("setprop \"{s}\" \"LD_PRELOAD=/data/local/tmp/bogusmips-gadget.so\" 2>/dev/null\n"))
+        .unwrap_or_default();
+    let log_path = bypass::FRIDA_DEVICE_LOG_PATH;
+    format!(
+        r#"GADGET=/data/local/tmp/bogusmips-gadget.so
+SCRIPT=/data/local/tmp/bogusmips-bypass.js
+CONFIG=/data/local/tmp/bogusmips-gadget.config
+CONFIG_SO=/data/local/tmp/bogusmips-gadget.config.so
+LOG={log_path}
+
+: > "$LOG"
+chmod 777 /data/local/tmp
+chmod 755 "$GADGET"
+chmod 644 "$SCRIPT" "$CONFIG" "$CONFIG_SO"
+chmod 666 "$LOG"
+# On Android 14/15, untrusted_app is denied `search` on shell_data_file
+# directories; relabel /data/local/tmp to system_data_file, the gadget
+# payloads to system_file, and the telemetry log to apk_data_file.
+chcon u:object_r:system_data_file:s0 /data/local/tmp 2>/dev/null
+chcon u:object_r:system_file:s0 "$GADGET" "$SCRIPT" "$CONFIG" "$CONFIG_SO" 2>/dev/null
+chcon u:object_r:apk_data_file:s0 "$LOG" 2>/dev/null
+setenforce 0 2>/dev/null
+
+# Prevent unspecialized app process (USAP) pool from bypassing wrap.<package>.
+setprop persist.device_config.runtime_native.usap_pool_enabled false 2>/dev/null
+setprop persist.sys.usap_pool_enabled false 2>/dev/null
+
+# Hide /system/xbin/su from untrusted_app (other) while keeping root:shell
+# access intact for `adb shell su root`.
+chown root:shell /system/xbin 2>/dev/null
+chmod 750 /system/xbin 2>/dev/null
+
+setprop "{prop}" "LD_PRELOAD=$GADGET"
+{short_cmd}am force-stop "{package}" 2>/dev/null
+echo ARMED"#
+    )
 }
 
 impl Drop for Emulator {
@@ -563,6 +616,18 @@ mod tests {
             Some("google_apis")
         );
         assert_eq!(ini_value(ini, "missing"), None);
+    }
+
+    #[test]
+    fn frida_arm_script_labels_tmp_dir_and_sets_wrap_prop() {
+        let script = frida_arm_script("de.clara.sharing.app");
+        assert!(script.contains("chcon u:object_r:system_data_file:s0 /data/local/tmp"));
+        assert!(script.contains("chcon u:object_r:system_file:s0"));
+        assert!(script.contains("setenforce 0"));
+        assert!(script.contains("usap_pool_enabled false"));
+        assert!(script.contains("chmod 750 /system/xbin"));
+        assert!(script.contains("setprop \"wrap.de.clara.sharing.app\""));
+        assert!(script.contains("echo ARMED"));
     }
 
     #[test]

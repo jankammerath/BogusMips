@@ -444,30 +444,32 @@ pub fn load_script(cache_dir: &Path, spec: &str) -> Result<(String, String), Str
     }
 }
 
-/// Logcat tag written by the gadget wrapper via `liblog.so`'s
-/// `__android_log_write` so output from autonomous `frida-gadget` scripts is
-/// reliably captured by `adb logcat` without a host Frida client.
+/// Logcat tag written by the gadget wrapper via `android.util.Log` and
+/// `liblog.so`'s `__android_log_write`.
 pub const FRIDA_LOGCAT_TAG: &str = "BogusMipsFrida";
+
+/// Device file where the gadget wrapper appends all status markers and script
+/// `console.log` / `send` output so the host can read them reliably via `adb`.
+pub const FRIDA_DEVICE_LOG_PATH: &str = "/data/local/tmp/bogusmips-frida.log";
 
 /// Assembles the JavaScript payload executed by `frida-gadget` for the enabled
 /// `user_scripts` (`(spec, js_source)`):
 /// 1. Bridges `console.log` / `console.warn` / `console.error` / `send(...)`
-///    directly to Android's `liblog.so` (`__android_log_write` with tag
+///    to [`FRIDA_DEVICE_LOG_PATH`] (via Frida's built-in `File` API), Android's
+///    `android.util.Log`, and `liblog.so` (`__android_log_write` with tag
 ///    [`FRIDA_LOGCAT_TAG`]), because autonomous `frida-gadget` in `"script"`
-///    interaction mode does not forward `console.log` to `logcat` on its own.
+///    interaction mode only prints to `stdout`.
 /// 2. Polyfills legacy Frida 12 `Memory.readCString` / `readUtf8String` /
 ///    `writeUtf8String` APIs and guards `Interceptor.attach` against hooking
 ///    `libc.so` `fopen`/`access`/`__system_property_get`/`system` (which
 ///    corrupt `.rodata` or deadlock `frida-gadget` on Android 14/15).
 /// 3. Avoids touching `globalThis.Java` during `LD_PRELOAD` (`t = 0ms`, before
 ///    ART exists, which would break `frida-java-bridge`'s lazy initialization).
-///    Once ART is up (~2s after launch), installs in-place guards on bootstrap
-///    classes (`java.lang.String`, `java.io.File`, `java.io.UnixFileSystem`,
-///    `java.io.BufferedReader`, `java.lang.Runtime`, `java.lang.ProcessImpl`,
-///    `java.lang.ProcessBuilder`) and `ApplicationPackageManager.getPackageInfo`
-///    without wrapping class handles in ES6 `Proxy` objects, then runs each user
-///    script inside `Java.perform`, emitting `[bogusmips:script:start|ok|error]`
-///    status markers.
+///    Once ART is up, installs in-place guards on bootstrap classes, makes
+///    `Field.set(null, ...)` on `static final` fields (such as `Build.TAGS` in
+///    `fdciabdul/frida-multiple-bypass`) fall back to Frida's JNI field setter
+///    instead of throwing `IllegalAccessException`, applies baseline root/GMS
+///    environment hooks, and runs each user script inside `Java.perform`.
 pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     if user_scripts.is_empty() {
         return String::new();
@@ -479,31 +481,46 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
   globalThis.__bogusmipsWrapped = true;
   var origSetTimeout = globalThis.setTimeout;
   var origSetImmediate = globalThis.setImmediate;
-
-  // 1. Bridge console.log / warn / error / send directly to Android logcat via
-  //    liblog.so (__android_log_write), since frida-gadget in autonomous
-  //    "script" mode does not route console.log to logcat without a client.
+  var FridaFile = (typeof File === 'function') ? File : null;
+  var origFindExport = (typeof Module !== 'undefined' && typeof Module.findExportByName === 'function')
+    ? Module.findExportByName.bind(Module)
+    : null;
   var logWrite = null;
   var logTag = null;
-  try {
-    var findExp = (typeof Module !== 'undefined' && Module.findExportByName)
-      ? Module.findExportByName.bind(Module)
-      : null;
-    if (findExp) {
-      var logAddr = findExp('liblog.so', '__android_log_write')
-        || findExp(null, '__android_log_write');
-      if (logAddr) {
-        logWrite = new NativeFunction(logAddr, 'int', ['int', 'pointer', 'pointer']);
-        logTag = Memory.allocUtf8String('BogusMipsFrida');
-      }
-    }
-  } catch (e) {}
+  var javaLog = null;
 
-  function writeLogcat(msg) {
-    if (!logWrite || !logTag) return;
+  function writeOutput(msg) {
+    var text = '' + msg;
+    // Channel 1: append to /data/local/tmp/bogusmips-frida.log via Frida's File API.
+    if (FridaFile) {
+      try {
+        var f = new FridaFile('/data/local/tmp/bogusmips-frida.log', 'a');
+        f.write(text + '\n');
+        f.flush();
+        f.close();
+      } catch (e) {}
+    }
+    // Channel 2: android.util.Log.i once ART is up.
+    if (javaLog) {
+      try {
+        javaLog.i('BogusMipsFrida', text);
+        return;
+      } catch (e) {}
+    }
+    // Channel 3: lazy liblog.so __android_log_write fallback.
     try {
-      var s = Memory.allocUtf8String('' + msg);
-      logWrite(4, logTag, s);
+      if (!logWrite && origFindExport) {
+        var logAddr = origFindExport('liblog.so', '__android_log_write')
+          || origFindExport(null, '__android_log_write');
+        if (logAddr) {
+          logWrite = new NativeFunction(logAddr, 'int', ['int', 'pointer', 'pointer']);
+          logTag = Memory.allocUtf8String('BogusMipsFrida');
+        }
+      }
+      if (logWrite && logTag) {
+        var s = Memory.allocUtf8String(text);
+        logWrite(4, logTag, s);
+      }
     } catch (e) {}
   }
 
@@ -524,15 +541,15 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
   var origConsoleWarn = console.warn ? console.warn.bind(console) : origConsoleLog;
   var origConsoleError = console.error ? console.error.bind(console) : origConsoleLog;
   console.log = function () {
-    writeLogcat(formatArgs(arguments));
+    writeOutput(formatArgs(arguments));
     try { origConsoleLog.apply(console, arguments); } catch (e) {}
   };
   console.warn = function () {
-    writeLogcat(formatArgs(arguments));
+    writeOutput(formatArgs(arguments));
     try { origConsoleWarn.apply(console, arguments); } catch (e) {}
   };
   console.error = function () {
-    writeLogcat(formatArgs(arguments));
+    writeOutput(formatArgs(arguments));
     try { origConsoleError.apply(console, arguments); } catch (e) {}
   };
   if (typeof send === 'function') {
@@ -540,11 +557,13 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     globalThis.send = function (message, data) {
       try {
         var text = (typeof message === 'string') ? message : JSON.stringify(message);
-        writeLogcat(text);
+        writeOutput(text);
       } catch (e) {}
       try { return origSend(message, data); } catch (e) {}
     };
   }
+
+  writeOutput('[bogusmips:gadget:loaded]');
 
   // 2. Polyfill Frida 12 Memory.* helpers used by older CodeShare scripts
   //    (e.g. fdciabdul/frida-multiple-bypass).
@@ -576,8 +595,7 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     'access': true, 'faccessat': true, 'stat': true, 'lstat': true, 'fstat': true,
     '__system_property_get': true, '__system_property_read': true, 'system': true
   };
-  if (typeof Module !== 'undefined' && typeof Module.findExportByName === 'function') {
-    var origFindExport = Module.findExportByName.bind(Module);
+  if (origFindExport) {
     Module.findExportByName = function (moduleName, exportName) {
       var addr = origFindExport(moduleName, exportName);
       try {
@@ -613,24 +631,140 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
   //    frida-java-bridge's lazy initialisation prematurely and breaks it.
   var shimsInstalled = false;
   var origPerform = null;
+  var origUse = null;
+  var envHooked = {};
+
+  function applyBaselineEnvHooks() {
+    if (!origUse) return;
+    function hookReturn(className, method, value) {
+      var key = className + '#' + method;
+      if (envHooked[key]) return;
+      try {
+        var cls = Java.use(className);
+        if (!cls || !cls[method]) return;
+        cls[method].overloads.forEach(function (ov) {
+          ov.implementation = function () { return value; };
+        });
+        envHooked[key] = true;
+      } catch (e) {}
+    }
+
+    ['com.google.android.gms.common.GoogleApiAvailability',
+     'com.google.android.gms.common.GoogleApiAvailabilityLight',
+     'com.google.android.gms.common.GooglePlayServicesUtil',
+     'com.google.android.gms.common.GooglePlayServicesUtilLight'].forEach(function (c) {
+      hookReturn(c, 'isGooglePlayServicesAvailable', 0);
+    });
+
+    ['isRooted', 'isRootedWithBusyBoxCheck', 'isRootedWithoutBusyBoxCheck',
+     'detectRootManagementApps', 'detectPotentiallyDangerousApps', 'detectRootCloakingApps',
+     'detectTestKeys', 'checkForBusyBoxBinary', 'checkForSuBinary', 'checkSuExists',
+     'checkForRWPaths', 'checkForDangerousProps', 'checkForRootNative',
+     'checkForMagiskBinary', 'checkForBinary'].forEach(function (m) {
+      hookReturn('com.scottyab.rootbeer.RootBeer', m, false);
+    });
+    hookReturn('com.scottyab.rootbeer.RootBeerNative', 'checkForRoot', 0);
+    hookReturn('com.scottyab.rootbeer.RootBeerNative', 'isLibraryLoaded', false);
+
+    if (!envHooked['Build.TAGS']) {
+      try {
+        var Build = origUse('android.os.Build');
+        Build.TAGS.value = 'release-keys';
+        Build.TYPE.value = 'user';
+        envHooked['Build.TAGS'] = true;
+      } catch (e) {}
+    }
+
+    if (!envHooked['File.exists']) {
+      try {
+        var JFile = Java.use('java.io.File');
+        var badNames = {
+          'su': true, 'busybox': true, 'supersu': true, 'Superuser.apk': true,
+          'KingoUser.apk': true, 'SuperSu.apk': true, 'magisk': true, 'daemonsu': true
+        };
+        JFile.exists.implementation = function () {
+          try {
+            var name = '' + this.getName();
+            if (badNames[name]) return false;
+          } catch (e) {}
+          return this.exists();
+        };
+        envHooked['File.exists'] = true;
+      } catch (e) {}
+    }
+
+    if (!envHooked['SystemProperties']) {
+      try {
+        var SystemProperties = Java.use('android.os.SystemProperties');
+        var safe = {
+          'ro.debuggable': '0',
+          'ro.secure': '1',
+          'service.adb.root': '0',
+          'ro.build.tags': 'release-keys',
+          'ro.build.type': 'user',
+          'ro.build.selinux': '1'
+        };
+        SystemProperties.get.overload('java.lang.String').implementation = function (key) {
+          var k = '' + key;
+          if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
+          return this.get(key);
+        };
+        SystemProperties.get.overload('java.lang.String', 'java.lang.String').implementation = function (key, def) {
+          var k = '' + key;
+          if (Object.prototype.hasOwnProperty.call(safe, k)) return safe[k];
+          return this.get(key, def);
+        };
+        envHooked['SystemProperties'] = true;
+      } catch (e) {}
+    }
+  }
 
   function installJavaShims() {
     if (shimsInstalled) return;
     shimsInstalled = true;
     origPerform = Java.perform.bind(Java);
-    var origUse = Java.use.bind(Java);
+    origUse = Java.use.bind(Java);
+    try { javaLog = origUse('android.util.Log'); } catch (e) {}
 
-    // Bootstrap methods whose ART trampolines cause infinite recursion or
-    // SIGABRT when replaced on Android 14/15 (API 34/35).
-    var unsafeClassMethods = {
-      'java.lang.String': ['contains'],
+    // Allow reflection Field.set(null, val) on static final fields (e.g.
+    // Build.TAGS in fdciabdul/frida-multiple-bypass) to fall back to Frida's
+    // JNI field setter instead of throwing IllegalAccessException on Android 12+.
+    try {
+      var Field = origUse('java.lang.reflect.Field');
+      Field.set.overload('java.lang.Object', 'java.lang.Object').implementation = function (obj, val) {
+        try {
+          return this.set(obj, val);
+        } catch (e) {
+          try {
+            var clsName = '' + this.getDeclaringClass().getName();
+            var fldName = '' + this.getName();
+            var w = origUse(clsName);
+            if (w && w[fldName]) w[fldName].value = val;
+          } catch (e2) {}
+        }
+      };
+    } catch (e) {}
+
+    // Methods that need in-place overload guarding:
+    // - java.lang.String#contains is blocked completely (causes infinite
+    //   recursion inside frida-java-bridge).
+    // - File/Runtime/ProcessBuilder/SystemProperties/PackageManager methods
+    //   are guarded with blockAll=false so scripts like fdciabdul/frida-multiple-bypass
+    //   that assign `.implementation` multiple times on the same overload
+    //   update the JS callback in-place without crashing ART.
+    var blockedClassMethods = {
+      'java.lang.String': ['contains']
+    };
+    var guardedClassMethods = {
       'java.io.File': ['exists'],
       'java.io.UnixFileSystem': ['checkAccess'],
       'java.io.BufferedReader': ['readLine'],
       'java.lang.Runtime': ['exec'],
       'java.lang.ProcessImpl': ['start'],
       'java.lang.ProcessBuilder': ['start'],
-      'java.lang.ProcessManager': ['exec']
+      'java.lang.ProcessManager': ['exec'],
+      'android.os.SystemProperties': ['get'],
+      'android.app.ApplicationPackageManager': ['getPackageInfo']
     };
     var hookedJavaOverloads = {};
 
@@ -644,11 +778,16 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
             configurable: true,
             get: function () { return origDesc.get.call(this); },
             set: function (fn) {
-              if (blockAll) return;
+              if (blockAll || typeof fn !== 'function') return;
+              ov.__bogusmipsUserFn = fn;
               var k = className + '#' + methodName + ':' + sigKey;
               if (hookedJavaOverloads[k]) return;
               hookedJavaOverloads[k] = true;
-              try { origDesc.set.call(this, fn); } catch (e) {}
+              try {
+                origDesc.set.call(this, function () {
+                  return ov.__bogusmipsUserFn.apply(this, arguments);
+                });
+              } catch (e) {}
             }
           });
         }
@@ -683,13 +822,17 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
       var name = '' + className;
       var cls = origUse(name);
       if (!cls) return cls;
-      var blocked = unsafeClassMethods[name];
+      var blocked = blockedClassMethods[name];
       if (blocked) {
         for (var i = 0; i < blocked.length; i++) {
           guardMethodOnClass(cls, name, blocked[i], true);
         }
-      } else if (name === 'android.app.ApplicationPackageManager') {
-        guardMethodOnClass(cls, name, 'getPackageInfo', false);
+      }
+      var guarded = guardedClassMethods[name];
+      if (guarded) {
+        for (var j = 0; j < guarded.length; j++) {
+          guardMethodOnClass(cls, name, guarded[j], false);
+        }
       }
       return cls;
     };
@@ -746,12 +889,13 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
     out.push_str(
         r#"  ];
 
-  var delays = [2000, 3500, 5500, 8000];
+  var delays = [1000, 2000, 3500, 5500, 8000];
   var attempt = 0;
   function bootAfterArt() {
     try {
       Java.perform(function () {
         installJavaShims();
+        applyBaselineEnvHooks();
         for (var i = 0; i < scripts.length; i++) {
           var s = scripts[i];
           console.log('[bogusmips:script:start] ' + s.spec);
@@ -762,6 +906,13 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
             console.log('[bogusmips:script:error] ' + s.spec + ' | ' + scriptErr);
           }
         }
+        // Re-apply baseline hooks for classes (e.g. RootBeer) loaded lazily.
+        origSetTimeout(function () {
+          try { origPerform(applyBaselineEnvHooks); } catch (e) {}
+        }, 1500);
+        origSetTimeout(function () {
+          try { origPerform(applyBaselineEnvHooks); } catch (e) {}
+        }, 3500);
       });
     } catch (artErr) {
       attempt += 1;

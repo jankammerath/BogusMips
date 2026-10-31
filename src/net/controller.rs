@@ -104,6 +104,10 @@ impl Status {
         if trimmed.is_empty() {
             return;
         }
+        if trimmed == "[bogusmips:gadget:loaded]" {
+            self.log("Frida gadget loaded into app process".to_owned());
+            return;
+        }
         if let Some(spec) = trimmed.strip_prefix("[bogusmips:script:start]") {
             let spec = spec.trim();
             if !self
