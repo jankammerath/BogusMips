@@ -1,10 +1,21 @@
-//! The interception proxy.
+//! The interception proxy (transparent + explicit).
 //!
-//! The emulator is pointed at this proxy. Plain HTTP arrives in absolute
-//! form (`GET http://host/path`); HTTPS arrives as a `CONNECT host:443`
-//! tunnel that we terminate with a generated leaf certificate (TLS
-//! man-in-the-middle) and then read as plaintext HTTP. Every request is
-//! re-originated to the real server so the full response can be captured.
+//! Outbound TCP connections from the emulator are transparently redirected to
+//! this proxy via `iptables -t nat` (`DNAT`), so all apps — including
+//! Dart/Flutter apps and native libraries that ignore Android's system proxy —
+//! are intercepted alongside clients speaking explicit HTTP/CONNECT proxy
+//! framing:
+//! - **Transparent HTTPS**: starts directly with a TLS `ClientHello` record
+//!   (`0x16`); the proxy terminates TLS using a dynamically generated leaf
+//!   certificate for the `ClientHello` SNI hostname and reads origin-form HTTP
+//!   requests inside the tunnel.
+//! - **Transparent HTTP**: arrives in origin-form (`GET /path HTTP/1.1` with a
+//!   `Host` header).
+//! - **Explicit HTTP / CONNECT**: plain HTTP in absolute form
+//!   (`GET http://host/path HTTP/1.1`) and HTTPS via `CONNECT host:443`.
+//!
+//! Every request is re-originated to the real server so the full response can
+//! be captured.
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -56,9 +67,10 @@ fn origin_form(target: &str) -> String {
     }
 }
 
-/// Authority for a plain-HTTP request given in absolute form.
+/// Authority for a request given in absolute form (`http://host/path` or
+/// `https://host/path`).
 fn authority_from_target(target: &str) -> Option<String> {
-    let rest = target.split_once("://").map(|(_, r)| r)?;
+    let (scheme_prefix, rest) = target.split_once("://")?;
     let end = rest.find('/').unwrap_or(rest.len());
     let host = &rest[..end];
     if host.is_empty() {
@@ -66,9 +78,53 @@ fn authority_from_target(target: &str) -> Option<String> {
     }
     Some(if host.contains(':') {
         host.to_owned()
+    } else if scheme_prefix.eq_ignore_ascii_case("https") {
+        format!("{host}:443")
     } else {
         format!("{host}:80")
     })
+}
+
+/// Resolves the target `host:port` authority for `req` across transparent and
+/// explicit proxy modes:
+/// 1. Absolute-form request target (`GET http://host:port/path HTTP/1.1`).
+/// 2. HTTP `Host` header (`Host: host` or `Host: host:port`), used by
+///    transparent plain-HTTP and transparent TLS connections.
+/// 3. `fixed_authority` from an explicit `CONNECT host:port` tunnel or the
+///    TLS `ClientHello` SNI extension.
+fn resolve_authority(
+    scheme: Scheme,
+    fixed_authority: Option<&str>,
+    req: &Request,
+) -> Option<String> {
+    if let Some(auth) = authority_from_target(&req.target) {
+        return Some(auth);
+    }
+    if let Some(host_hdr) = req
+        .headers
+        .get("Host")
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+    {
+        let (hdr_host, normalized) = authority_parts(host_hdr, scheme);
+        if !host_hdr.contains(':') {
+            if let Some(fixed) = fixed_authority {
+                let (fixed_host, _) = authority_parts(fixed, scheme);
+                if fixed_host.eq_ignore_ascii_case(&hdr_host) {
+                    return Some(fixed.to_owned());
+                }
+            }
+        }
+        return Some(normalized);
+    }
+    fixed_authority.map(ToOwned::to_owned)
+}
+
+/// Returns `true` when the first byte on an accepted TCP stream is a TLS
+/// Handshake record (`0x16`), indicating a transparent TLS/HTTPS connection
+/// without an HTTP `CONNECT` preface.
+fn is_tls_client_hello(first_byte: u8) -> bool {
+    first_byte == 0x16
 }
 
 fn send_simple(client: &mut impl Write, status: &str, message: &str) {
@@ -113,8 +169,9 @@ fn forward(
 
 /// Reads requests from an accepted client connection and proxies each one,
 /// keeping the connection alive. `fixed_authority` is set for MITM'd HTTPS
-/// (where every request targets the tunneled host); plain HTTP derives the
-/// authority from each absolute-form request line.
+/// (from `CONNECT` or the TLS `ClientHello` SNI); transparent and explicit
+/// HTTP (or SNI-less TLS) derive the authority from the request target or
+/// `Host` header.
 pub fn run_session<S: Read + Write>(
     stream: S,
     scheme: Scheme,
@@ -135,15 +192,13 @@ pub fn run_session<S: Read + Write>(
             },
         };
 
-        let authority = match &fixed_authority {
-            Some(a) => a.clone(),
-            None => match authority_from_target(&req.target) {
-                Some(a) => a,
-                None => {
-                    send_simple(reader.get_mut(), "400 Bad Request", "Expected an absolute URL");
-                    break;
-                }
-            },
+        let Some(authority) = resolve_authority(scheme, fixed_authority.as_deref(), &req) else {
+            send_simple(
+                reader.get_mut(),
+                "400 Bad Request",
+                "Missing Host header or target authority",
+            );
+            break;
         };
 
         let info = RequestInfo::from_request(scheme, &authority, &req, req.body.len() + 256);
@@ -237,11 +292,11 @@ impl Proxy {
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
 
-        let server_config = Arc::new(
-            ServerConfig::builder()
-                .with_no_client_auth()
-                .with_cert_resolver(Arc::new(SniResolver(ca))),
-        );
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SniResolver(ca)));
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_config = Arc::new(server_config);
         let running = Arc::new(AtomicBool::new(true));
 
         let ctx = Arc::new(ProxyThreads {
@@ -318,7 +373,37 @@ fn accept_loop(listener: TcpListener, ctx: Arc<ProxyThreads>) {
     }
 }
 
-fn handle_connection(stream: TcpStream, ctx: &ProxyThreads) {
+fn handle_connection(mut stream: TcpStream, ctx: &ProxyThreads) {
+    let mut first_byte = [0u8; 1];
+    match stream.peek(&mut first_byte) {
+        Ok(1) if is_tls_client_hello(first_byte[0]) => {
+            // Transparent TLS/HTTPS connection (e.g. Dart/Flutter or native
+            // socket redirected via iptables DNAT without a CONNECT tunnel).
+            let mut conn = match ServerConnection::new(ctx.server_config.clone()) {
+                Ok(conn) => conn,
+                Err(_) => return,
+            };
+            while conn.is_handshaking() {
+                if conn.complete_io(&mut stream).is_err() {
+                    return;
+                }
+            }
+            let authority = conn.server_name().map(|host| format!("{host}:443"));
+            let tls = StreamOwned::new(conn, stream);
+            run_session(
+                tls,
+                Scheme::Https,
+                authority,
+                None,
+                ctx.connector.as_ref(),
+                &ctx.capture,
+            );
+            return;
+        }
+        Ok(1) => {}
+        _ => return,
+    }
+
     let mut reader = BufReader::new(stream);
     let first = match Request::read(&mut reader) {
         Ok(Some(req)) => req,
@@ -680,6 +765,167 @@ mod tests {
         assert_eq!(flow.status, Some(200));
         assert_eq!(flow.resp_headers.get("x-test"), Some("yes"));
         assert_eq!(flow.path, "/hello");
+    }
+
+    #[test]
+    fn proxies_transparent_plain_http_origin_form_via_host_header() {
+        let c = connector("HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndart");
+        let (capture, reply) = run(
+            "GET /v1/flutter?x=1 HTTP/1.1\r\nHost: api.flutter.dev\r\nUser-Agent: Dart/3.5 (dart:io)\r\n\r\n",
+            Scheme::Http,
+            None,
+            &c,
+        );
+        let flow = &capture.snapshot()[0];
+        assert_eq!(flow.method, "GET");
+        assert_eq!(flow.url(), "http://api.flutter.dev/v1/flutter?x=1");
+        assert_eq!(flow.status, Some(200));
+        assert_eq!(flow.resp_body, b"dart");
+        assert!(reply.contains("200 OK") && reply.ends_with("dart"));
+        let (scheme, authority, bytes) = &c.log.lock().unwrap()[0];
+        assert_eq!((*scheme, authority.as_str()), (Scheme::Http, "api.flutter.dev:80"));
+        let sent = String::from_utf8_lossy(bytes);
+        assert!(sent.starts_with("GET /v1/flutter?x=1 HTTP/1.1\r\n"));
+        assert!(sent.contains("Host: api.flutter.dev\r\n"));
+    }
+
+    #[test]
+    fn transparent_https_tls_without_connect_is_decrypted() {
+        use super::super::ca::CertAuthority;
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
+        use std::net::TcpStream;
+
+        let ca = Arc::new(CertAuthority::new().unwrap());
+        let capture = Arc::new(Capture::new());
+        let connector = Arc::new(FakeConnector {
+            response: b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nContent-Type: text/plain\r\n\r\nflutter"
+                .to_vec(),
+            fail: false,
+            log: Arc::new(Mutex::new(Vec::new())),
+        });
+        let proxy =
+            Proxy::start_with_connector(ca.clone(), capture.clone(), connector.clone()).unwrap();
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca.ca_cert_der().to_vec()))
+            .unwrap();
+        let client_config = Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
+
+        // Connect directly and speak TLS (SNI = pub.dev) WITHOUT sending an
+        // HTTP CONNECT preface — simulating a Dart/Flutter socket redirected
+        // by iptables DNAT.
+        let tcp = TcpStream::connect(("127.0.0.1", proxy.port())).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let name = ServerName::try_from("pub.dev").unwrap();
+        let conn = ClientConnection::new(client_config, name).unwrap();
+        let mut tls = StreamOwned::new(conn, tcp);
+        write!(
+            tls,
+            "GET /api/packages/http HTTP/1.1\r\nHost: pub.dev\r\nUser-Agent: Dart/3.5\r\n\r\n"
+        )
+        .unwrap();
+
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 256];
+        for _ in 0..10 {
+            match tls.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(k) => {
+                    reply.extend_from_slice(&chunk[..k]);
+                    if reply.windows(7).any(|w| w == b"flutter") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.contains("200 OK") && reply.contains("flutter"), "{reply}");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while capture.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let flow = &capture.snapshot()[0];
+        assert_eq!(flow.scheme, Scheme::Https);
+        assert_eq!(flow.url(), "https://pub.dev/api/packages/http");
+        assert_eq!(flow.status, Some(200));
+        assert_eq!(flow.resp_body, b"flutter");
+    }
+
+    #[test]
+    fn transparent_tls_handshake_and_sni_routing_works_in_memory() {
+        use super::super::ca::CertAuthority;
+        use rustls::pki_types::{CertificateDer, ServerName};
+        use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
+
+        let ca = Arc::new(CertAuthority::new().unwrap());
+        let mut server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SniResolver(ca.clone())));
+        server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let server_config = Arc::new(server_config);
+
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(CertificateDer::from(ca.ca_cert_der().to_vec()))
+            .unwrap();
+        let mut client_config = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+        let name = ServerName::try_from("api.flutter.dev").unwrap();
+        let mut client = ClientConnection::new(Arc::new(client_config), name).unwrap();
+        let mut server = ServerConnection::new(server_config).unwrap();
+
+        // First client flight starts with 0x16 (TLS Handshake ClientHello).
+        let mut client_hello = Vec::new();
+        client.write_tls(&mut client_hello).unwrap();
+        assert!(is_tls_client_hello(client_hello[0]));
+
+        server.read_tls(&mut client_hello.as_slice()).unwrap();
+        server.process_new_packets().unwrap();
+        for _ in 0..20 {
+            let mut s_buf = Vec::new();
+            server.write_tls(&mut s_buf).unwrap();
+            if !s_buf.is_empty() {
+                client.read_tls(&mut s_buf.as_slice()).unwrap();
+                client.process_new_packets().unwrap();
+            }
+            let mut c_buf = Vec::new();
+            client.write_tls(&mut c_buf).unwrap();
+            if !c_buf.is_empty() {
+                server.read_tls(&mut c_buf.as_slice()).unwrap();
+                server.process_new_packets().unwrap();
+            }
+            if !client.is_handshaking() && !server.is_handshaking() {
+                break;
+            }
+        }
+
+        assert_eq!(server.server_name(), Some("api.flutter.dev"));
+        assert_eq!(server.alpn_protocol(), Some(b"http/1.1".as_slice()));
+
+        let sni_authority = server.server_name().map(|h| format!("{h}:443"));
+        let c = connector("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+        let (capture, reply) = run(
+            "GET /packages HTTP/1.1\r\nHost: api.flutter.dev\r\n\r\n",
+            Scheme::Https,
+            sni_authority.as_deref(),
+            &c,
+        );
+        let flow = &capture.snapshot()[0];
+        assert_eq!(flow.scheme, Scheme::Https);
+        assert_eq!(flow.url(), "https://api.flutter.dev/packages");
+        assert_eq!(flow.status, Some(200));
+        assert!(reply.contains("200 OK"));
     }
 
     #[test]

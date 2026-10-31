@@ -392,11 +392,22 @@ impl Emulator {
         }
     }
 
-    /// Routes all guest traffic through the proxy (reached via the host alias).
+    /// Transparently redirects all outbound guest TCP traffic (including
+    /// Dart/Flutter and native sockets that ignore Android's system proxy) to
+    /// the host proxy via `iptables -t nat` (`DNAT`).
     pub fn set_global_proxy(&self, proxy_port: u16) -> Step {
+        const PROXY_SCRIPT: &str = "/data/local/tmp/bogusmips_transparent_proxy.sh";
         let proxy = format!("{HOST_ALIAS}:{proxy_port}");
-        self.adb(&["shell", "settings", "put", "global", "http_proxy", &proxy])
-            .map(|_| format!("proxy set to {proxy}"))
+        let script = transparent_proxy_script(proxy_port);
+        self.push_bytes(script.as_bytes(), PROXY_SCRIPT)?;
+        let out = self
+            .adb(&["shell", "su", "root", "sh", PROXY_SCRIPT])
+            .or_else(|_| self.adb(&["shell", "sh", PROXY_SCRIPT]))?;
+        if out.contains("TRANSPARENT_PROXY") {
+            Ok(format!("transparent proxy set to {proxy}"))
+        } else {
+            Err(format!("could not configure transparent proxy: {out}"))
+        }
     }
 
     /// Launches the app's main activity.
@@ -417,7 +428,17 @@ impl Emulator {
     }
 
     pub fn clear_proxy(&self) {
-        let _ = self.adb(&["shell", "settings", "put", "global", "http_proxy", ":0"]);
+        const CLEAR_SCRIPT: &str = "/data/local/tmp/bogusmips_clear_proxy.sh";
+        if self
+            .push_bytes(clear_proxy_script().as_bytes(), CLEAR_SCRIPT)
+            .is_ok()
+        {
+            let _ = self
+                .adb(&["shell", "su", "root", "sh", CLEAR_SCRIPT])
+                .or_else(|_| self.adb(&["shell", "sh", CLEAR_SCRIPT]));
+        } else {
+            let _ = self.adb(&["shell", "settings", "put", "global", "http_proxy", ":0"]);
+        }
     }
 
     /// The device's primary ABI (e.g. `arm64-v8a`), used to pick the gadget.
@@ -508,6 +529,80 @@ impl Emulator {
             .map(ToOwned::to_owned)
             .collect()
     }
+}
+
+/// Shell script executed as `root` on the device to transparently redirect all
+/// outbound TCP traffic (including Dart/Flutter and native sockets that do not
+/// honor Android's system proxy) to `10.0.2.2:<proxy_port>` via `iptables`
+/// `nat` `OUTPUT` `DNAT`.
+pub fn transparent_proxy_script(proxy_port: u16) -> String {
+    format!(
+        r#"PROXY="{HOST_ALIAS}:{proxy_port}"
+
+# Clear explicit system proxy settings so apps do not detect a configured proxy
+# and all traffic uniformly flows through the transparent netfilter DNAT rules.
+settings put global http_proxy :0 2>/dev/null
+settings delete global http_proxy 2>/dev/null
+settings delete global global_http_proxy_host 2>/dev/null
+settings delete global global_http_proxy_port 2>/dev/null
+
+# Reset and rebuild the IPv4 NAT OUTPUT chain.
+iptables -t nat -D OUTPUT -p tcp -j BOGUSMIPS_PROXY 2>/dev/null
+iptables -t nat -F BOGUSMIPS_PROXY 2>/dev/null
+iptables -t nat -X BOGUSMIPS_PROXY 2>/dev/null
+if iptables -t nat -N BOGUSMIPS_PROXY 2>/dev/null; then
+  # Exclude loopback, emulator internal subnets (10.0.2.0/24 contains 10.0.2.2
+  # host proxy and 10.0.2.3 DNS), link-local, multicast, and broadcast.
+  iptables -t nat -A BOGUSMIPS_PROXY -d 127.0.0.0/8 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -d 10.0.2.0/24 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -d 192.168.0.0/16 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -d 169.254.0.0/16 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -d 224.0.0.0/4 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -d 255.255.255.255/32 -j RETURN
+
+  # Exclude DNS (53), DoT (853), and Google Play GCM/FCM mtalk (5228-5230).
+  iptables -t nat -A BOGUSMIPS_PROXY -p tcp --dport 53 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -p tcp --dport 853 -j RETURN
+  iptables -t nat -A BOGUSMIPS_PROXY -p tcp --dport 5228:5230 -j RETURN
+
+  # Redirect all remaining outbound TCP traffic to the transparent host proxy.
+  iptables -t nat -A BOGUSMIPS_PROXY -p tcp -j DNAT --to-destination "$PROXY"
+  iptables -t nat -I OUTPUT 1 -p tcp -j BOGUSMIPS_PROXY
+
+  # Reject non-local IPv6 TCP so dual-stack clients (Dart/Flutter, Cronet,
+  # OkHttp) immediately fall back to IPv4 and hit BOGUSMIPS_PROXY.
+  ip6tables -t filter -D OUTPUT -p tcp -j BOGUSMIPS_PROXY6 2>/dev/null
+  ip6tables -t filter -F BOGUSMIPS_PROXY6 2>/dev/null
+  ip6tables -t filter -X BOGUSMIPS_PROXY6 2>/dev/null
+  if ip6tables -t filter -N BOGUSMIPS_PROXY6 2>/dev/null; then
+    ip6tables -t filter -A BOGUSMIPS_PROXY6 -d ::1/128 -j RETURN 2>/dev/null
+    ip6tables -t filter -A BOGUSMIPS_PROXY6 -d fe80::/10 -j RETURN 2>/dev/null
+    ip6tables -t filter -A BOGUSMIPS_PROXY6 -p tcp -j REJECT --reject-with tcp-reset 2>/dev/null
+    ip6tables -t filter -I OUTPUT 1 -p tcp -j BOGUSMIPS_PROXY6 2>/dev/null
+  fi
+  echo TRANSPARENT_PROXY_IPTABLES
+else
+  # Fallback if the guest kernel lacks netfilter NAT support.
+  settings put global http_proxy "$PROXY"
+  echo TRANSPARENT_PROXY_FALLBACK
+fi"#
+    )
+}
+
+/// Shell script executed as `root` on the device to remove the transparent
+/// `iptables` / `ip6tables` rules and clear the global proxy setting.
+pub fn clear_proxy_script() -> &'static str {
+    r#"settings put global http_proxy :0 2>/dev/null
+settings delete global http_proxy 2>/dev/null
+settings delete global global_http_proxy_host 2>/dev/null
+settings delete global global_http_proxy_port 2>/dev/null
+iptables -t nat -D OUTPUT -p tcp -j BOGUSMIPS_PROXY 2>/dev/null
+iptables -t nat -F BOGUSMIPS_PROXY 2>/dev/null
+iptables -t nat -X BOGUSMIPS_PROXY 2>/dev/null
+ip6tables -t filter -D OUTPUT -p tcp -j BOGUSMIPS_PROXY6 2>/dev/null
+ip6tables -t filter -F BOGUSMIPS_PROXY6 2>/dev/null
+ip6tables -t filter -X BOGUSMIPS_PROXY6 2>/dev/null
+echo PROXY_CLEARED"#
 }
 
 /// Shell script executed as `root` on the device to set up the Frida runtime
@@ -697,6 +792,21 @@ mod tests {
             Some("google_apis")
         );
         assert_eq!(ini_value(ini, "missing"), None);
+    }
+
+    #[test]
+    fn transparent_proxy_script_configures_iptables_dnat_and_cleanup() {
+        let script = transparent_proxy_script(54321);
+        assert!(script.contains("iptables -t nat -N BOGUSMIPS_PROXY"));
+        assert!(script.contains("-d 10.0.2.0/24 -j RETURN"));
+        assert!(script.contains("-p tcp -j DNAT --to-destination \"$PROXY\""));
+        assert!(script.contains("10.0.2.2:54321"));
+        assert!(script.contains("ip6tables -t filter -N BOGUSMIPS_PROXY6"));
+        assert!(script.contains("TRANSPARENT_PROXY"));
+
+        let clear = clear_proxy_script();
+        assert!(clear.contains("iptables -t nat -D OUTPUT -p tcp -j BOGUSMIPS_PROXY"));
+        assert!(clear.contains("ip6tables -t filter -D OUTPUT -p tcp -j BOGUSMIPS_PROXY6"));
     }
 
     #[test]

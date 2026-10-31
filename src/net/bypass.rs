@@ -629,15 +629,15 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
   var bogusmipsConsole = makeDelegate(typeof console !== 'undefined' ? console : {}, {
     log: function () {
       writeOutput(formatArgs(arguments));
-      try { origConsoleLog.apply(console, arguments); } catch (e) {}
+      if (!FridaFile) { try { origConsoleLog.apply(console, arguments); } catch (e) {} }
     },
     warn: function () {
       writeOutput(formatArgs(arguments));
-      try { origConsoleWarn.apply(console, arguments); } catch (e) {}
+      if (!FridaFile) { try { origConsoleWarn.apply(console, arguments); } catch (e) {} }
     },
     error: function () {
       writeOutput(formatArgs(arguments));
-      try { origConsoleError.apply(console, arguments); } catch (e) {}
+      if (!FridaFile) { try { origConsoleError.apply(console, arguments); } catch (e) {} }
     }
   });
   var origSend = (typeof globalThis.send === 'function') ? globalThis.send : null;
@@ -646,7 +646,7 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
       var text = (typeof message === 'string') ? message : JSON.stringify(message);
       writeOutput(text);
     } catch (e) {}
-    if (origSend) {
+    if (!FridaFile && origSend) {
       try { return origSend(message, data); } catch (e) {}
     }
   };
@@ -856,6 +856,37 @@ pub fn build_gadget_script(user_scripts: &[(String, String)]) -> String {
           return this.get(key, def);
         };
         envHooked['SystemProperties'] = true;
+      } catch (e) {}
+    }
+
+    if (!envHooked['FlutterBoringSsl'] && typeof Process !== 'undefined' && typeof Process.findModuleByName === 'function') {
+      try {
+        var flutterMod = Process.findModuleByName('libflutter.so');
+        if (flutterMod && typeof Memory !== 'undefined' && typeof Memory.scanSync === 'function') {
+          var patterns = [
+            'FF 83 01 D1 F6 57 01 A9 F4 4F 02 A9 FD 7B 03 A9 FD C3 00 91',
+            'FF 43 01 D1 FE 67 01 A9 F8 5F 02 A9 F6 57 03 A9 F4 4F 04 A9',
+            'F? 0F 1C F8 F? 5? 01 A9 F? 5? 02 A9 F? ?? 03 A9 ?? ?? ?? ?? 68 1A 40 F9',
+            'FF C3 01 D1 FD 7B 01 A9 FC 6F 02 A9 FA 67 03 A9 F8 5F 04 A9 F6 57 05 A9 F4 4F 06 A9 08 0A 80 52 48 00 00 39'
+          ];
+          var ranges = flutterMod.enumerateRanges('r-x');
+          var hookedFlutter = false;
+          for (var r = 0; r < ranges.length && !hookedFlutter; r++) {
+            for (var p = 0; p < patterns.length && !hookedFlutter; p++) {
+              try {
+                var matches = Memory.scanSync(ranges[r].base, ranges[r].size, patterns[p]);
+                if (matches && matches.length > 0) {
+                  bogusmipsInterceptor.attach(matches[0].address, {
+                    onLeave: function (retval) { retval.replace(0x1); }
+                  });
+                  hookedFlutter = true;
+                  writeOutput('[+] libflutter.so BoringSSL verification bypassed');
+                }
+              } catch (e) {}
+            }
+          }
+          envHooked['FlutterBoringSsl'] = true;
+        }
       } catch (e) {}
     }
   }
