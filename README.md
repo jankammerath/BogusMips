@@ -28,6 +28,8 @@ BogusMips is written in Rust and allows performing analyses on how far your Andr
   - **AI Agent**: prompt an AI agent about the disassembled smali source code, decoded resource files (`AndroidManifest.xml`, `resources.arsc` values), and captured HTTP/HTTPS network traffic. Configurable with **Grok (xAI)**, **Gemini (Google)**, **Claude (Anthropic)**, **OpenAI (ChatGPT)**, or any custom OpenAI-compatible endpoint (e.g. Ollama, OpenRouter). The agent has built-in tools (`search_package`, `list_nodes`, `read_node`, `list_network_flows`, `inspect_network_flow`) to autonomously search and read classes, resources, and captured network flows.
   - **File / Request information**: size, compression, CRC, SHA-256, DEX header details, class details, manifest summary, permissions, and any anomalies found.
 
+![Grok writing Python script based on network capture](/screenshots/screenshot3.png)
+
 ### Network
 
 The **Network** view (⇧⌘N) is a stripped-down, Postman-like traffic sniffer. It starts an Android emulator (AVD), routes the guest's traffic through a built-in man-in-the-middle proxy, installs the open APK/XAPK, launches it, and captures its HTTP **and HTTPS** requests live. Captured requests appear in a list on the left; selecting one shows its full request/response (headers and body, pretty / raw / hex) in the editor, with timing and connection details in the information panel.
